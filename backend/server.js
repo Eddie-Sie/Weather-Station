@@ -25,7 +25,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
 // Light rate limit on auth routes to slow down brute-force
-app.use('/api/auth', rateLimit({ windowMs: 15*60*1000, max: 30 }));
+app.use('/api/auth', rateLimit({ windowMs: 15*60*1000, max: 400 }));
 
 // ---- Health check ----
 app.get('/', (req, res) => res.json({ ok: true, service: 'weather-station-api' }));
