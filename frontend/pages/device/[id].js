@@ -14,37 +14,6 @@ const SENSOR_LABELS = {
   water:       'Water',
 };
 
-// Keys shown as tiles on the Live tab. Note `airquality` is synthetic —
-// derived from voc + nox so students see a single clear rating instead of
-// two raw index numbers.
-const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'pm25', 'water'];
-const LIVE_TILE_LABELS = { ...SENSOR_LABELS, airquality: 'Air Quality' };
-
-function airQualityFromSensors(sensors) {
-  const voc = sensors?.voc;
-  const nox = sensors?.nox;
-  // Both sensors disconnected → tile is disconnected
-  if ((!voc || voc.status === 'disconnected') && (!nox || nox.status === 'disconnected')) {
-    return { status: 'disconnected' };
-  }
-  if (voc?.status === 'error' && nox?.status === 'error') {
-    return { status: 'error' };
-  }
-  const vocIdx = typeof voc?.value === 'number' ? voc.value : 0;
-  const noxIdx = typeof nox?.value === 'number' ? nox.value : 0;
-  // SGP41 gas-index algorithm returns 0 during the 1–3 minute warmup.
-  if (vocIdx === 0 && noxIdx === 0) {
-    return { status: 'ok', label: 'Warming up', tone: 'bg-slate-100 text-slate-600', idx: null };
-  }
-  // Combined AQ = worst of the two (higher index = worse air).
-  const idx = Math.max(vocIdx, noxIdx);
-  if (idx <= 100) return { status: 'ok', label: 'Good',       tone: 'bg-green-100 text-green-800',   idx };
-  if (idx <= 200) return { status: 'ok', label: 'Moderate',   tone: 'bg-yellow-100 text-yellow-800', idx };
-  if (idx <= 300) return { status: 'ok', label: 'Poor',       tone: 'bg-orange-100 text-orange-800', idx };
-  if (idx <= 400) return { status: 'ok', label: 'Unhealthy',  tone: 'bg-red-100 text-red-800',       idx };
-  return            { status: 'ok', label: 'Severe',     tone: 'bg-rose-200 text-rose-900',     idx };
-}
-
 export default function DevicePage() {
   const router = useRouter();
   const { id } = router.query;
@@ -114,26 +83,20 @@ export default function DevicePage() {
 
       {tab === 'live' && (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-          {LIVE_TILE_KEYS.map(k => {
+          {Object.keys(SENSOR_LABELS).map(k => {
+            const s = sensors[k] || { status: 'disconnected' };
             const isWater = k === 'water';
-            const isAq    = k === 'airquality';
-            const s = isAq ? airQualityFromSensors(sensors) : (sensors[k] || { status: 'disconnected' });
             const bg = s.status === 'ok'
               ? (isWater && s.state === 'raining' ? 'bg-blue-50' : 'bg-white')
               : s.status === 'error' ? 'bg-red-50' : 'bg-slate-100 opacity-70';
             return (
               <div key={k} className={`rounded-xl shadow p-4 ${bg}`}>
-                <p className="text-xs uppercase text-slate-500">{LIVE_TILE_LABELS[k]}</p>
+                <p className="text-xs uppercase text-slate-500">{SENSOR_LABELS[k]}</p>
                 {s.status === 'ok' ? (
-                  isAq ? (
-                    <div className="mt-1">
-                      <span className={`inline-block rounded px-2 py-1 text-lg font-bold ${s.tone}`}>{s.label}</span>
-                      {s.idx != null && <p className="text-xs text-slate-400 mt-2">Index: {s.idx}  (higher = worse)</p>}
-                    </div>
-                  ) : isWater ? (
+                  isWater ? (
                     <div className="mt-1">
                       <p className="text-2xl font-bold">
-                        {(s.state || (typeof s.value === 'number' && s.value >= 400 ? 'raining' : 'clear')) === 'raining'
+                        {(s.state || (typeof s.value === 'number' && s.value <= 180 ? 'raining' : 'clear')) === 'raining'
                           ? '🌧️ Raining'
                           : '☀️ Clear'}
                       </p>
