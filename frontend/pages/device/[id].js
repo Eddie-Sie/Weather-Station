@@ -96,7 +96,7 @@ export default function DevicePage() {
                   isWater ? (
                     <div className="mt-1">
                       <p className="text-2xl font-bold">
-                        {(s.state || (typeof s.value === 'number' && s.value >= 400 ? 'raining' : 'clear')) === 'raining'
+                        {(s.state || (typeof s.value === 'number' && s.value <= 180 ? 'raining' : 'clear')) === 'raining'
                           ? '🌧️ Raining'
                           : '☀️ Clear'}
                       </p>
