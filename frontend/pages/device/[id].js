@@ -14,6 +14,57 @@ const SENSOR_LABELS = {
   water:       'Water',
 };
 
+// Fixed y-axis ranges so charts are comparable across sessions and the
+// vertical position of the line actually carries physical meaning.
+const Y_RANGES = {
+  temperature: [30, 110],   // °F, room-cold to a hot afternoon
+  humidity:    [0, 100],    // %RH
+  pressure:    [950, 1050], // hPa, full atmospheric range at sea level
+  voc:         [0, 500],    // Sensirion gas index
+  nox:         [0, 500],    // Sensirion gas index
+  pm25:        [0, 100],    // ug/m3
+  water:       [0, 1023],   // raw ADC
+};
+
+// Keys shown as tiles on the Live tab. Note `airquality` is synthetic —
+// derived from voc + nox so students see a single clear rating instead of
+// two raw index numbers.
+const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'pm25', 'water'];
+const LIVE_TILE_LABELS = { ...SENSOR_LABELS, airquality: 'Air Quality' };
+
+// Pretty-print sensor units. Firmware sends plain "F" / "C" / "%" — we map
+// the thermal ones to include the degree symbol so the tile reads naturally.
+function displayUnit(u) {
+  if (u === 'F') return '°F';
+  if (u === 'C') return '°C';
+  return u || '';
+}
+
+function airQualityFromSensors(sensors) {
+  const voc = sensors?.voc;
+  const nox = sensors?.nox;
+  // Both sensors disconnected → tile is disconnected
+  if ((!voc || voc.status === 'disconnected') && (!nox || nox.status === 'disconnected')) {
+    return { status: 'disconnected' };
+  }
+  if (voc?.status === 'error' && nox?.status === 'error') {
+    return { status: 'error' };
+  }
+  const vocIdx = typeof voc?.value === 'number' ? voc.value : 0;
+  const noxIdx = typeof nox?.value === 'number' ? nox.value : 0;
+  // SGP41 gas-index algorithm returns 0 during the 1–3 minute warmup.
+  if (vocIdx === 0 && noxIdx === 0) {
+    return { status: 'ok', label: 'Warming up', tone: 'bg-slate-100 text-slate-600', idx: null };
+  }
+  // Combined AQ = worst of the two (higher index = worse air).
+  const idx = Math.max(vocIdx, noxIdx);
+  if (idx <= 100) return { status: 'ok', label: 'Good',       tone: 'bg-green-100 text-green-800',   idx };
+  if (idx <= 200) return { status: 'ok', label: 'Moderate',   tone: 'bg-yellow-100 text-yellow-800', idx };
+  if (idx <= 300) return { status: 'ok', label: 'Poor',       tone: 'bg-orange-100 text-orange-800', idx };
+  if (idx <= 400) return { status: 'ok', label: 'Unhealthy',  tone: 'bg-red-100 text-red-800',       idx };
+  return            { status: 'ok', label: 'Severe',     tone: 'bg-rose-200 text-rose-900',     idx };
+}
+
 export default function DevicePage() {
   const router = useRouter();
   const { id } = router.query;
@@ -83,27 +134,33 @@ export default function DevicePage() {
 
       {tab === 'live' && (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-          {Object.keys(SENSOR_LABELS).map(k => {
-            const s = sensors[k] || { status: 'disconnected' };
+          {LIVE_TILE_KEYS.map(k => {
             const isWater = k === 'water';
+            const isAq    = k === 'airquality';
+            const s = isAq ? airQualityFromSensors(sensors) : (sensors[k] || { status: 'disconnected' });
             const bg = s.status === 'ok'
               ? (isWater && s.state === 'raining' ? 'bg-blue-50' : 'bg-white')
               : s.status === 'error' ? 'bg-red-50' : 'bg-slate-100 opacity-70';
             return (
               <div key={k} className={`rounded-xl shadow p-4 ${bg}`}>
-                <p className="text-xs uppercase text-slate-500">{SENSOR_LABELS[k]}</p>
+                <p className="text-xs uppercase text-slate-500">{LIVE_TILE_LABELS[k]}</p>
                 {s.status === 'ok' ? (
-                  isWater ? (
+                  isAq ? (
+                    <div className="mt-1">
+                      <span className={`inline-block rounded px-2 py-1 text-lg font-bold ${s.tone}`}>{s.label}</span>
+                      {s.idx != null && <p className="text-xs text-slate-400 mt-2">Index: {s.idx}  (higher = worse)</p>}
+                    </div>
+                  ) : isWater ? (
                     <div className="mt-1">
                       <p className="text-2xl font-bold">
-                        {(s.state || (typeof s.value === 'number' && s.value <= 180 ? 'raining' : 'clear')) === 'raining'
+                        {(s.state || (typeof s.value === 'number' && s.value >= 400 ? 'raining' : 'clear')) === 'raining'
                           ? '🌧️ Raining'
                           : '☀️ Clear'}
                       </p>
                       <p className="text-xs text-slate-400 mt-1">raw: {s.value}</p>
                     </div>
                   ) : (
-                    <p className="text-2xl font-bold">{formatValue(k, s.value)} <span className="text-sm font-normal text-slate-500">{s.unit}</span></p>
+                    <p className="text-2xl font-bold">{formatValue(k, s.value)} <span className="text-sm font-normal text-slate-500">{displayUnit(s.unit)}</span></p>
                   )
                 ) : (
                   <p className="text-sm font-semibold text-slate-500 mt-1">{s.status}</p>
@@ -120,10 +177,15 @@ export default function DevicePage() {
             <button onClick={exportCsv} className="bg-blue-900 text-white rounded px-4 py-2 text-sm">Export CSV</button>
           </div>
           {Object.keys(SENSOR_LABELS).map(k => {
-            const data = history.map(r => ({
-              ts: new Date(r.ts).getTime(),
-              value: typeof r.sensors?.[k]?.value === 'number' ? r.sensors[k].value : null,
-            })).reverse();
+            // Build the series and explicitly sort by timestamp ascending so
+            // the x-axis always reads left-to-right in normal forward time,
+            // regardless of how the backend returned the array.
+            const data = history
+              .map(r => ({
+                ts: new Date(r.ts).getTime(),
+                value: typeof r.sensors?.[k]?.value === 'number' ? r.sensors[k].value : null,
+              }))
+              .sort((a, b) => a.ts - b.ts);
             return (
               <div key={k} className="bg-white rounded-xl shadow p-4 mb-4">
                 <h3 className="font-semibold mb-2">{SENSOR_LABELS[k]}</h3>
@@ -131,10 +193,16 @@ export default function DevicePage() {
                   <ResponsiveContainer>
                     <LineChart data={data}>
                       <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="ts" tickFormatter={t => new Date(t).toLocaleTimeString()} />
-                      <YAxis domain={['auto', 'auto']} />
+                      <XAxis
+                        dataKey="ts"
+                        type="number"
+                        domain={['dataMin', 'dataMax']}
+                        scale="time"
+                        tickFormatter={t => new Date(t).toLocaleTimeString()}
+                      />
+                      <YAxis domain={Y_RANGES[k] || ['auto', 'auto']} allowDataOverflow />
                       <Tooltip labelFormatter={t => new Date(t).toLocaleString()} />
-                      <Line type="monotone" dataKey="value" dot={false} stroke="#0b3d91" />
+                      <Line type="monotone" dataKey="value" dot={false} stroke="#0b3d91" isAnimationActive={false} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>

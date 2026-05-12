@@ -46,17 +46,23 @@
 // The base URL of your deployed backend. During local testing use your
 // computer's LAN IP (e.g. http://192.168.1.20:4000). In production use
 // the https URL of your Render deployment (see docs/05-deploying-online.md).
-#define API_BASE_URL "http://10.191.51.160:4000"
+#define API_BASE_URL "https://weather-station-api-9zq4.onrender.com"
 // ===========================================================================
 
 #define READ_INTERVAL_MS     60000   // 60 seconds
-#define REPROBE_EVERY_N      5       // re-run setupSensors() every 5 cycles
+#define REPROBE_EVERY_N      2       // re-run setupSensors() every 2 cycles (helps the I²C extension catch sensors that didn't enumerate on cold boot)
 #define BUFFER_FILE          "/buffer.jsonl"
 #define CONFIG_FILE          "/config.json"
 #define WATER_PIN            A0
-#define AP_PASSWORD          "weatherstation"   // 8+ chars required by ESP8266
+#define FACTORY_RESET_PIN    0      // GPIO0 = FLASH button on NodeMCU. Hold at boot to wipe config.
+#define AP_PASSWORD          "corefutures16"   // 8+ chars required by ESP8266
 #define DNS_PORT             53
 #define MAX_BUFFER_BYTES     150000  // ~150 KB of readings before we stop appending
+#define AP_FALLBACK_AFTER_MS 10000   // 10 seconds — if WiFi hasn't connected by then, bring up the portal as a fallback so students can reconfigure
+// Water sensor thresholds (ESP8266 ADC range 0..1023).
+// Readings around 250 are typical "dry air" noise on the Grove water sensor.
+// Increase WATER_RAIN_THRESHOLD if you get false positives in humid air.
+#define WATER_RAIN_THRESHOLD 210
 
 // ---- Globals --------------------------------------------------------------
 Adafruit_AHTX0       aht;
@@ -87,7 +93,16 @@ struct Config {
 
 String deviceId;
 unsigned long lastReadAt = 0;
+unsigned long lastWifiRetryAt = 0;
+unsigned long lastSgpTickAt = 0;
+unsigned long wifiOfflineSinceMs = 0;  // when we last lost/failed WiFi this boot
+bool fallbackAPActive = false;          // true when we've spun up the portal as a fallback
 uint32_t cycleCounter = 0;
+uint32_t sgpConditioningSecs = 0;   // first 10 ticks use executeConditioning(), then measureRawSignals()
+int32_t cachedVocIdx = 0;
+int32_t cachedNoxIdx = 0;
+bool     sgpReady    = false;       // true once we have real samples flowing
+bool clockSynced = false;
 
 // ---- Forward declarations -------------------------------------------------
 void   loadConfig();
@@ -96,7 +111,9 @@ void   startProvisioningPortal();
 void   handlePortalRoot();
 void   handlePortalSave();
 void   handlePortalStatus();
+void   handlePortalScan();
 bool   connectToWifi();
+void   tickSgp41();
 void   setupSensors();
 bool   readAll(StaticJsonDocument<1024>& doc);
 bool   postReading(const String& body);
@@ -115,6 +132,8 @@ void setup() {
 
   deviceId = "WN-" + macSuffix();
   Serial.printf("Device ID: %s\n", deviceId.c_str());
+  Serial.printf("Fallback AP name: WeatherNode-%s   password: %s\n", macSuffix().c_str(), AP_PASSWORD);
+  Serial.println(F("(If WiFi isn't reachable for ~10 seconds, this AP will appear automatically.)"));
 
   if (!LittleFS.begin()) {
     Serial.println(F("LittleFS mount failed, formatting..."));
@@ -122,8 +141,40 @@ void setup() {
     LittleFS.begin();
   }
 
-  Wire.begin();           // ESP8266 default: SDA=GPIO4 (D2), SCL=GPIO5 (D1)
+  Wire.begin();             // ESP8266 default: SDA=GPIO4 (D2), SCL=GPIO5 (D1)
+  // 50 kHz instead of the default 100 kHz. The cabled Grove I²C extension adds
+  // capacitance, slows down the rising edge, and makes far sensors (PM2.5 +
+  // pressure) miss the ACK at 100 kHz. 50 kHz is fully within spec and the
+  // 60-second sampling cadence makes the lower bandwidth a non-issue.
+  Wire.setClock(50000);
+  delay(100);               // let the bus settle before we probe sensors
   setupSensors();
+
+  // ---- Factory reset: hold FLASH button (GPIO0) for 3 seconds at boot ----
+  pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
+  if (digitalRead(FACTORY_RESET_PIN) == LOW) {
+    Serial.println(F("FLASH button held at boot — checking for 3s hold..."));
+    unsigned long start = millis();
+    while (digitalRead(FACTORY_RESET_PIN) == LOW) {
+      if (millis() - start > 3000) {
+        Serial.println(F("Factory reset: wiping saved config + WiFi credentials, rebooting into portal."));
+        // 1. Wipe LittleFS-stored device config (SSID, password, pairing code, device token).
+        LittleFS.remove(CONFIG_FILE);
+        LittleFS.remove(BUFFER_FILE);
+        // 2. Wipe the ESP8266 SDK's own internal WiFi store — this is in a
+        // separate flash region from LittleFS, so removing /config.json is
+        // NOT enough on its own. Without this, the next boot's WiFi.begin()
+        // silently rejoins the previously saved network.
+        WiFi.persistent(true);
+        WiFi.disconnect(true /* wifioff */, true /* eraseAP */);
+        WiFi.persistent(false);
+        ESP.eraseConfig();
+        delay(500);
+        ESP.restart();
+      }
+      delay(50);
+    }
+  }
 
   loadConfig();
 
@@ -133,14 +184,16 @@ void setup() {
     return;   // stay in portal mode, loop() will handle requests
   }
 
+  // Try to join the saved WiFi. If it fails, DON'T drop into AP mode —
+  // the main loop will keep retrying in the background. This prevents the
+  // device from getting stuck in the captive portal after a brief outage.
   if (!connectToWifi()) {
-    Serial.println(F("Could not join saved WiFi — entering provisioning mode."));
-    startProvisioningPortal();
-    return;
+    Serial.println(F("Could not join saved WiFi yet — will keep retrying from loop()."));
+  } else {
+    syncClock();
+    clockSynced = (time(nullptr) > 100000);
+    registerDeviceIfNeeded();
   }
-
-  syncClock();
-  registerDeviceIfNeeded();
   lastReadAt = millis() - READ_INTERVAL_MS;   // force an immediate first reading
 }
 
@@ -152,10 +205,63 @@ void loop() {
     return;
   }
 
+  // Background WiFi retry: if we lost (or never got) a connection, try
+  // once every 30 seconds without blocking the rest of the loop.
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("WiFi dropped, attempting reconnect..."));
-    WiFi.reconnect();
-    delay(3000);
+    if (wifiOfflineSinceMs == 0) wifiOfflineSinceMs = millis();
+    if (millis() - lastWifiRetryAt > 30000) {
+      lastWifiRetryAt = millis();
+      Serial.println(F("WiFi not connected — retrying..."));
+      WiFi.reconnect();
+    }
+    // If WiFi has been offline too long, bring up the AP portal as a fallback
+    // so students can always reconfigure. WiFi keeps trying in the background.
+    if (!fallbackAPActive && millis() - wifiOfflineSinceMs > AP_FALLBACK_AFTER_MS) {
+      Serial.println(F("WiFi unreachable for 10 seconds — starting AP fallback so you can reconfigure."));
+      WiFi.mode(WIFI_AP_STA);
+      String apName = "WeatherNode-" + macSuffix();
+      WiFi.softAP(apName.c_str(), AP_PASSWORD);
+      Serial.printf("AP up: %s  pass: %s  IP: ", apName.c_str(), AP_PASSWORD);
+      Serial.println(WiFi.softAPIP());
+      dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+      if (!inProvisioningMode) {
+        portalServer.on("/",       handlePortalRoot);
+        portalServer.on("/save",   HTTP_POST, handlePortalSave);
+        portalServer.on("/status", handlePortalStatus);
+        portalServer.on("/scan",   handlePortalScan);
+        portalServer.onNotFound(   handlePortalRoot);
+        portalServer.begin();
+      }
+      fallbackAPActive = true;
+    }
+    if (fallbackAPActive) {
+      dnsServer.processNextRequest();
+      portalServer.handleClient();
+    }
+  } else {
+    // WiFi is connected.
+    if (fallbackAPActive) {
+      Serial.println(F("WiFi reconnected — shutting down AP fallback."));
+      WiFi.softAPdisconnect(true);
+      dnsServer.stop();
+      WiFi.mode(WIFI_STA);
+      fallbackAPActive = false;
+    }
+    wifiOfflineSinceMs = 0;
+    if (!clockSynced) {
+      // First time we're online this boot — sync NTP and register.
+      syncClock();
+      clockSynced = (time(nullptr) > 100000);
+      registerDeviceIfNeeded();
+    }
+  }
+
+  // The Sensirion gas-index algorithm is designed for 1 Hz sampling. If we
+  // only poll once per 60 s the algorithm never converges and VOC/NOx stay
+  // at 0 forever. So we tick SGP41 every second here and cache the index.
+  if (millis() - lastSgpTickAt >= 1000) {
+    lastSgpTickAt = millis();
+    tickSgp41();
   }
 
   if (millis() - lastReadAt >= READ_INTERVAL_MS) {
@@ -180,24 +286,68 @@ void loop() {
 }
 
 // ===== SENSOR INIT =========================================================
+// Only tries to init sensors that are currently missing — working sensors are
+// left alone so we don't disturb them. Called at boot and on the re-probe
+// cycle (to pick up sensors that got plugged back in).
 void setupSensors() {
-  have_aht = aht.begin();
-  Serial.printf("AHT20 : %s\n", have_aht ? "OK" : "not found");
-
-  have_bmp = bmp.begin(0x76) || bmp.begin(0x77);
-  Serial.printf("BMP280: %s\n", have_bmp ? "OK" : "not found");
-
-  sgp41.begin(Wire);
-  uint16_t serialNumber[3];
-  uint8_t  serialLen = 3;
-  uint16_t err = sgp41.getSerialNumber(serialNumber, serialLen);
-  have_sgp41 = (err == 0);
-  Serial.printf("SGP41 : %s\n", have_sgp41 ? "OK" : "not found");
-
-  have_hm3301 = (hm3301.init() == NO_ERROR);
-  Serial.printf("HM3301: %s\n", have_hm3301 ? "OK" : "not found");
-
+  if (!have_aht) {
+    have_aht = aht.begin();
+    Serial.printf("AHT20 : %s\n", have_aht ? "OK" : "not found");
+  }
+  if (!have_bmp) {
+    have_bmp = bmp.begin(0x76) || bmp.begin(0x77);
+    Serial.printf("BMP280: %s\n", have_bmp ? "OK" : "not found");
+  }
+  if (!have_sgp41) {
+    sgp41.begin(Wire);
+    uint16_t serialNumber[3];
+    uint16_t err = sgp41.getSerialNumber(serialNumber);
+    have_sgp41 = (err == 0);
+    Serial.printf("SGP41 : %s\n", have_sgp41 ? "OK" : "not found");
+  }
+  if (!have_hm3301) {
+    have_hm3301 = (hm3301.init() == NO_ERROR);
+    Serial.printf("HM3301: %s\n", have_hm3301 ? "OK" : "not found");
+  }
   pinMode(WATER_PIN, INPUT);
+}
+
+// Must be called ~once per second. First 10 ticks run executeConditioning()
+// (hot-plate conditioning as Sensirion specifies); after that we switch to
+// measureRawSignals() and feed the gas-index algorithm so VOC/NOx produce
+// real 0..500 values instead of staying at 0.
+void tickSgp41() {
+  if (!have_sgp41) return;
+
+  // Pull the latest temperature + humidity for sensor compensation.
+  uint16_t rhTicks = 0x8000;   // default 50% RH
+  uint16_t tTicks  = 0x6666;   // default 25 C
+  if (have_aht) {
+    sensors_event_t humEvt, tempEvt;
+    if (aht.getEvent(&humEvt, &tempEvt)) {
+      rhTicks = (uint16_t)((humEvt.relative_humidity * 65535) / 100);
+      tTicks  = (uint16_t)(((tempEvt.temperature + 45) * 65535) / 175);
+    }
+  }
+
+  if (sgpConditioningSecs < 10) {
+    uint16_t rawVoc = 0;
+    uint16_t err = sgp41.executeConditioning(rhTicks, tTicks, rawVoc);
+    if (err != 0) { Serial.printf("SGP41 conditioning err=%u\n", err); }
+    sgpConditioningSecs++;
+    if (sgpConditioningSecs == 10) Serial.println(F("SGP41 conditioning complete, switching to measurement."));
+    return;
+  }
+
+  uint16_t rawVoc = 0, rawNox = 0;
+  uint16_t err = sgp41.measureRawSignals(rhTicks, tTicks, rawVoc, rawNox);
+  if (err != 0) {
+    Serial.printf("SGP41 measure err=%u\n", err);
+    return;
+  }
+  cachedVocIdx = voc_algo.process(rawVoc);
+  cachedNoxIdx = nox_algo.process(rawNox);
+  sgpReady = true;
 }
 
 // ===== READ ALL SENSORS INTO A JSON DOC ====================================
@@ -213,8 +363,12 @@ bool readAll(StaticJsonDocument<1024>& doc) {
     if (have_aht) {
       sensors_event_t humEvt, tempEvt;
       if (aht.getEvent(&humEvt, &tempEvt)) {
-        t["value"]  = tempEvt.temperature;
-        t["unit"]   = "C";
+        // Sensor reads in Celsius; convert to Fahrenheit at the source so the
+        // number stored in the backend + shown on the dashboard is already °F.
+        // (SGP41 compensation below still uses the raw Celsius value — Sensirion
+        // requires Celsius for its gas-index algorithm.)
+        t["value"]  = tempEvt.temperature * 9.0F / 5.0F + 32.0F;
+        t["unit"]   = "F";
         t["status"] = "ok";
         h["value"]  = humEvt.relative_humidity;
         h["unit"]   = "%";
@@ -246,32 +400,20 @@ bool readAll(StaticJsonDocument<1024>& doc) {
   }
 
   // ---- SGP41 (VOC + NOx index) ----
+  // The sensor is now sampled every ~1 second from tickSgp41() in loop().
+  // Here we just report the cached index the algorithm has converged on.
   {
     JsonObject v = s.createNestedObject("voc");
     JsonObject n = s.createNestedObject("nox");
-    if (have_sgp41) {
-      // SGP41 wants compensation values; use AHT data if we have it, else defaults
-      uint16_t rhTicks = 0x8000;   // 50% RH default
-      uint16_t tTicks  = 0x6666;   // 25 C default
-      if (have_aht) {
-        sensors_event_t humEvt, tempEvt;
-        if (aht.getEvent(&humEvt, &tempEvt)) {
-          rhTicks = (uint16_t)((humEvt.relative_humidity * 65535) / 100);
-          tTicks  = (uint16_t)(((tempEvt.temperature + 45) * 65535) / 175);
-        }
-      }
-      uint16_t rawVoc = 0, rawNox = 0;
-      uint16_t err = sgp41.measureRawSignals(rhTicks, tTicks, rawVoc, rawNox);
-      if (err == 0) {
-        int32_t vocIdx = voc_algo.process(rawVoc);
-        int32_t noxIdx = nox_algo.process(rawNox);
-        v["value"] = vocIdx; v["unit"] = "index"; v["status"] = "ok";
-        n["value"] = noxIdx; n["unit"] = "index"; n["status"] = "ok";
-      } else {
-        v["status"] = "error"; n["status"] = "error";
-      }
-    } else {
+    if (!have_sgp41) {
       v["status"] = "disconnected"; n["status"] = "disconnected";
+    } else if (!sgpReady) {
+      // First 10 seconds: sensor conditioning. Report as "warming up".
+      v["status"] = "ok"; v["value"] = 0; v["unit"] = "index";
+      n["status"] = "ok"; n["value"] = 0; n["unit"] = "index";
+    } else {
+      v["value"] = cachedVocIdx; v["unit"] = "index"; v["status"] = "ok";
+      n["value"] = cachedNoxIdx; n["unit"] = "index"; n["status"] = "ok";
     }
   }
 
@@ -301,7 +443,8 @@ bool readAll(StaticJsonDocument<1024>& doc) {
     w["value"]  = raw;
     w["unit"]   = "raw";
     w["status"] = "ok";
-    // Higher raw reading = wetter. You can convert to % in the frontend.
+    w["state"]  = (raw <= WATER_RAIN_THRESHOLD) ? "raining" : "clear";
+    // Higher raw reading = wetter. Threshold is WATER_RAIN_THRESHOLD above.
   }
 
   return true;
@@ -309,11 +452,23 @@ bool readAll(StaticJsonDocument<1024>& doc) {
 
 // ===== NETWORKING ==========================================================
 bool connectToWifi() {
+  // Clear any stale state from AP mode / previous boot
+  WiFi.persistent(false);            // don't wear out flash on every begin()
+  WiFi.setAutoReconnect(true);       // auto-recover from brief dropouts
+  WiFi.mode(WIFI_AP);
+  delay(100);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP); // faster response, less hanging
+  WiFi.disconnect(true);             // wipe any cached AP
+  delay(100);
   WiFi.hostname(deviceId);
   WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
   Serial.printf("Joining WiFi '%s'", cfg.wifiSsid.c_str());
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; ++i) {
+  // Wait up to 10 seconds (20 * 500ms). If it hasn't joined by then, setup()
+  // exits and the main loop will bring up the AP fallback within ~10 more
+  // seconds so the user can reconfigure. Auto-reconnect keeps trying in the
+  // background, so if the network comes back the AP shuts itself down.
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; ++i) {
     delay(500);
     Serial.print('.');
   }
@@ -322,6 +477,7 @@ bool connectToWifi() {
     Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
     return true;
   }
+  Serial.printf("WiFi status after timeout: %d\n", WiFi.status());
   return false;
 }
 
@@ -346,10 +502,21 @@ bool registerDeviceIfNeeded() {
   String body;
   serializeJson(doc, body);
 
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  String url = String(API_BASE_URL) + "/api/devices/register";
   HTTPClient http;
-  http.begin(*client, String(API_BASE_URL) + "/api/devices/register");
+  WiFiClient          plainClient;
+  BearSSL::WiFiClientSecure tlsClient;
+  bool beganOk = false;
+  if (url.startsWith("https://")) {
+    tlsClient.setInsecure();
+    beganOk = http.begin(tlsClient, url);
+  } else {
+    beganOk = http.begin(plainClient, url);
+  }
+  if (!beganOk) {
+    Serial.println(F("http.begin failed (register)"));
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   Serial.printf("Register HTTP %d\n", code);
@@ -357,7 +524,7 @@ bool registerDeviceIfNeeded() {
     String resp = http.getString();
     StaticJsonDocument<256> r;
     if (!deserializeJson(r, resp)) {
-      cfg.deviceToken = (const char*) r["token"];
+      cfg.deviceToken = (const char*)(r["token"] | "");
       saveConfig();
       http.end();
       return true;
@@ -370,10 +537,21 @@ bool registerDeviceIfNeeded() {
 bool postReading(const String& body) {
   if (cfg.deviceToken.length() == 0 && !registerDeviceIfNeeded()) return false;
 
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  String url = String(API_BASE_URL) + "/api/readings";
   HTTPClient http;
-  http.begin(*client, String(API_BASE_URL) + "/api/readings");
+  WiFiClient          plainClient;
+  BearSSL::WiFiClientSecure tlsClient;
+  bool beganOk = false;
+  if (url.startsWith("https://")) {
+    tlsClient.setInsecure();
+    beganOk = http.begin(tlsClient, url);
+  } else {
+    beganOk = http.begin(plainClient, url);
+  }
+  if (!beganOk) {
+    Serial.println(F("http.begin failed (reading)"));
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", deviceId);
   http.addHeader("X-Device-Token", cfg.deviceToken);
@@ -429,13 +607,13 @@ void loadConfig() {
   if (!f) return;
   StaticJsonDocument<512> d;
   if (deserializeJson(d, f)) { f.close(); return; }
-  cfg.wifiSsid     = (const char*) d["wifiSsid"]     | "";
-  cfg.wifiPass     = (const char*) d["wifiPass"]     | "";
-  cfg.pairingCode  = (const char*) d["pairingCode"]  | "";
-  cfg.locationName = (const char*) d["locationName"] | "";
+  cfg.wifiSsid     = (const char*)(d["wifiSsid"]     | "");
+  cfg.wifiPass     = (const char*)(d["wifiPass"]     | "");
+  cfg.pairingCode  = (const char*)(d["pairingCode"]  | "");
+  cfg.locationName = (const char*)(d["locationName"] | "");
   cfg.latitude     = d["latitude"]  | 0.0;
   cfg.longitude    = d["longitude"] | 0.0;
-  cfg.deviceToken  = (const char*) d["deviceToken"]  | "";
+  cfg.deviceToken  = (const char*)(d["deviceToken"]  | "");
   f.close();
 }
 
@@ -470,8 +648,31 @@ void startProvisioningPortal() {
   portalServer.on("/",        handlePortalRoot);
   portalServer.on("/save",    HTTP_POST, handlePortalSave);
   portalServer.on("/status",  handlePortalStatus);
+  portalServer.on("/scan",    handlePortalScan);
   portalServer.onNotFound(    handlePortalRoot);   // captive portal catch-all
   portalServer.begin();
+}
+
+// Returns visible 2.4GHz networks as JSON so the portal page can show a
+// pickable list. Crucial for students whose router broadcasts 5GHz networks
+// (which the ESP8266 cannot see at all).
+void handlePortalScan() {
+  // Temporarily switch to AP+STA so we can scan while keeping the portal up.
+  WiFi.mode(WIFI_AP_STA);
+  int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+  String j = "[";
+  for (int i = 0; i < n; i++) {
+    if (i) j += ",";
+    String ssid = WiFi.SSID(i);
+    ssid.replace("\"", "\\\"");
+    j += "{\"ssid\":\"" + ssid + "\",";
+    j += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    j += "\"open\":" + String(WiFi.encryptionType(i) == ENC_TYPE_NONE ? "true" : "false") + "}";
+  }
+  j += "]";
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_AP);   // back to AP-only so the portal stays responsive
+  portalServer.send(200, "application/json", j);
 }
 
 void handlePortalRoot() {
