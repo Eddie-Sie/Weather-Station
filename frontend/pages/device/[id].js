@@ -21,7 +21,7 @@ const SENSOR_LABELS = {
 const Y_RANGES = {
   temperature: [30, 110],   // °F, room-cold to a hot afternoon
   humidity:    [0, 100],    // %RH
-  pressure:    [950, 1050], // hPa, full atmospheric range at sea level
+  pressure:    [300, 1200], // hPa, matches the firmware's sane-range validator
   voc:         [0, 500],    // Sensirion gas index
   nox:         [0, 500],    // Sensirion gas index
   pm25:        [0, 100],    // ug/m3
