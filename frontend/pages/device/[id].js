@@ -123,10 +123,24 @@ export default function DevicePage() {
   }, [id, tab]);
 
   function exportCsv() {
-    const rows = [['timestamp', ...Object.keys(SENSOR_LABELS)]];
+    // Resolve the viewer's local timezone (IANA name, e.g. "Africa/Accra" or
+    // "America/New_York"). The CSV is written in that timezone so the times
+    // match the user's wall clock — the DB still stores UTC, which is correct.
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+    // Format a JS Date as "YYYY-MM-DD HH:MM:SS" in the local timezone. This
+    // is the format Excel and Google Sheets auto-recognise as a datetime.
+    const fmtLocal = (d) => {
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+             `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+
+    const rows = [['timestamp_local', 'timezone', ...Object.keys(SENSOR_LABELS)]];
     for (const r of history) {
       rows.push([
-        new Date(r.ts).toISOString(),
+        fmtLocal(new Date(r.ts)),
+        tz,
         ...Object.keys(SENSOR_LABELS).map(k => r.sensors?.[k]?.value ?? ''),
       ]);
     }
@@ -134,7 +148,11 @@ export default function DevicePage() {
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `${device?.deviceId || 'device'}-readings.csv`; a.click();
+    a.href = url;
+    // Add today's local date to the filename so successive exports don't overwrite.
+    const today = fmtLocal(new Date()).slice(0, 10);
+    a.download = `${device?.deviceId || 'device'}-readings-${today}.csv`;
+    a.click();
     URL.revokeObjectURL(url);
   }
 
