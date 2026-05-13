@@ -6,7 +6,7 @@
  *   - AHT20         (temperature + humidity)   I2C addr 0x38
  *   - SGP41         (VOC + NOx)                I2C addr 0x59
  *   - HM3301        (PM2.5 / PM1.0 / PM10)     I2C addr 0x40
- *   - BMP280        (barometric pressure)      I2C addr 0x76 or 0x77
+ *   - DPS310        (barometric pressure)      I2C addr 0x77 (default) or 0x76
  *   - Water sensor  (analog on A0)
  *
  * First boot: starts a WiFi AP called "WeatherNode-XXXX" with a captive
@@ -15,7 +15,7 @@
  *
  * Libraries to install via Arduino Library Manager:
  *   - Adafruit AHTX0
- *   - Adafruit BMP280 Library
+ *   - Adafruit DPS310
  *   - Sensirion I2C SGP41
  *   - Sensirion Gas Index Algorithm
  *   - Grove - Laser PM2.5 Sensor HM3301   (search "Grove HM330X")
@@ -36,7 +36,7 @@
 #include <time.h>
 
 #include <Adafruit_AHTX0.h>
-#include <Adafruit_BMP280.h>
+#include <Adafruit_DPS310.h>
 #include <SensirionI2CSgp41.h>
 #include <NOxGasIndexAlgorithm.h>
 #include <VOCGasIndexAlgorithm.h>
@@ -66,14 +66,14 @@
 
 // ---- Globals --------------------------------------------------------------
 Adafruit_AHTX0       aht;
-Adafruit_BMP280      bmp;
+Adafruit_DPS310      dps;
 SensirionI2CSgp41    sgp41;
 VOCGasIndexAlgorithm voc_algo;
 NOxGasIndexAlgorithm nox_algo;
 HM330X               hm3301;
 
 bool have_aht    = false;
-bool have_bmp    = false;
+bool have_dps    = false;
 bool have_sgp41  = false;
 bool have_hm3301 = false;
 
@@ -294,9 +294,17 @@ void setupSensors() {
     have_aht = aht.begin();
     Serial.printf("AHT20 : %s\n", have_aht ? "OK" : "not found");
   }
-  if (!have_bmp) {
-    have_bmp = bmp.begin(0x76) || bmp.begin(0x77);
-    Serial.printf("BMP280: %s\n", have_bmp ? "OK" : "not found");
+  if (!have_dps) {
+    // Adafruit_DPS310's begin_I2C() probes 0x77 by default, then 0x76 as a
+    // fallback if you pass the alt address explicitly.
+    have_dps = dps.begin_I2C(0x77) || dps.begin_I2C(0x76);
+    if (have_dps) {
+      // Reasonable defaults for a 60-second sampling cadence: 64 Hz / 64
+      // samples gives good resolution without burning CPU between reads.
+      dps.configurePressure(DPS310_64HZ, DPS310_64SAMPLES);
+      dps.configureTemperature(DPS310_64HZ, DPS310_64SAMPLES);
+    }
+    Serial.printf("DPS310: %s\n", have_dps ? "OK" : "not found");
   }
   if (!have_sgp41) {
     sgp41.begin(Wire);
@@ -381,18 +389,27 @@ bool readAll(StaticJsonDocument<1024>& doc) {
     }
   }
 
-  // ---- BMP280 (pressure) ----
+  // ---- DPS310 (pressure) ----
   {
     JsonObject p = s.createNestedObject("pressure");
-    if (have_bmp) {
-      float pa = bmp.readPressure();
-      if (isnan(pa) || pa < 30000 || pa > 120000) {   // sane range 300..1200 hPa
-        p["status"] = "error";
-        have_bmp = false;                              // force re-probe next cycle
+    if (have_dps) {
+      sensors_event_t pressureEvt;
+      // pressureAvailable() guards against the sensor not having a fresh
+      // sample ready. With our 60-second cadence and 64Hz config this is
+      // essentially always true, but we check anyway to avoid stale data.
+      if (dps.pressureAvailable() && dps.getEvents(NULL, &pressureEvt)) {
+        float hpa = pressureEvt.pressure;              // library already returns hPa
+        if (isnan(hpa) || hpa < 300 || hpa > 1200) {   // sane range
+          p["status"] = "error";
+          have_dps = false;                            // force re-probe next cycle
+        } else {
+          p["value"]  = hpa;
+          p["unit"]   = "hPa";
+          p["status"] = "ok";
+        }
       } else {
-        p["value"]  = pa / 100.0F;                     // hPa
-        p["unit"]   = "hPa";
-        p["status"] = "ok";
+        p["status"] = "error";
+        have_dps = false;
       }
     } else {
       p["status"] = "disconnected";
