@@ -16,12 +16,14 @@ const SENSOR_LABELS = {
   water:       'Water',
 };
 
-// Fixed y-axis ranges so charts are comparable across sessions and the
-// vertical position of the line actually carries physical meaning.
+// Fixed y-axis ranges chosen for *visualisation*, not for sensor validation.
+// The firmware's sanity-check ranges are intentionally wider (e.g. 300–1200 hPa
+// to reject clearly broken readings); here we tighten each axis to the typical
+// real-world range so day-to-day variation is actually visible on the chart.
 const Y_RANGES = {
-  temperature: [30, 110],   // °F, room-cold to a hot afternoon
-  humidity:    [0, 100],    // %RH
-  pressure:    [300, 1200], // hPa, matches the firmware's sane-range validator
+  temperature: [60, 100],   // °F, typical indoor + outdoor in Ghana
+  humidity:    [0, 100],    // %RH, natural full range
+  pressure:    [300, 1200], // hPa, matches the firmware's full sanity-check range (user-requested)
   voc:         [0, 500],    // Sensirion gas index
   nox:         [0, 500],    // Sensirion gas index
   pm25:        [0, 100],    // ug/m3
@@ -55,10 +57,16 @@ function ticksEvery12h(min, max) {
 
 function format12hTick(t) {
   const d = new Date(t);
-  if (d.getHours() === 0) {
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  }
-  return '12h';
+  const h = d.getHours();
+  // Exact midnight: show the date (e.g. "May 12").
+  if (h === 0) return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  // Exact noon: show "12h" as the user requested.
+  if (h === 12) return '12h';
+  // Any other tick (Recharts auto-picks these when our generated tick array
+  // is empty — i.e. the data range doesn't cross a midnight or noon yet).
+  // Show the time of day as e.g. "14h" so labels carry real meaning instead
+  // of all reading the same.
+  return `${h}h`;
 }
 
 // Pretty-print sensor units. Firmware sends plain "F" / "C" / "%" — we map
