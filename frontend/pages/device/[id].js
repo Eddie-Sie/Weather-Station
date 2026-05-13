@@ -22,7 +22,7 @@ const SENSOR_LABELS = {
 // real-world range so day-to-day variation is actually visible on the chart.
 const Y_RANGES = {
   temperature: [0, 130],    // °F, broad ambient range
-  humidity:    [10, 100],   // %RH, clipped low-end (sensor floor)
+  humidity:    [0, 100],    // %RH, natural full range
   pressure:    [300, 1200], // hPa, matches the firmware's full sanity-check range
   voc:         [0, 500],    // Sensirion gas index (full scale)
   nox:         [0, 5],      // NOx index zoomed to typical clean-air range
