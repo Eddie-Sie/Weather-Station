@@ -582,21 +582,23 @@ void flushBuffer() {
   if (!f) return;
 
   Serial.println(F("Flushing buffered readings..."));
-  bool allOk = true;
+  int  flushed = 0;
+  bool allOk   = true;
   String line;
   while (f.available()) {
     line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
     if (!postReading(line)) { allOk = false; break; }
+    flushed++;
     yield();
   }
   f.close();
   if (allOk) {
     LittleFS.remove(BUFFER_FILE);
-    Serial.println(F("Buffer flushed and cleared."));
+    Serial.printf("Buffer flushed and cleared. %d readings pushed.\n", flushed);
   } else {
-    Serial.println(F("Flush interrupted; will retry next cycle."));
+    Serial.printf("Flush interrupted after %d readings; will retry next cycle.\n", flushed);
   }
 }
 

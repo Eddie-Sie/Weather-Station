@@ -4,13 +4,15 @@ import Link from 'next/link';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { api } from '../../lib/api';
 
+// NOTE: PM2.5 (HM3301) is temporarily hidden from the UI while we sort out
+// reliability on the I²C extension. Backend still records it; to bring it
+// back, restore the `pm25: 'PM2.5'` entry here AND in LIVE_TILE_KEYS below.
 const SENSOR_LABELS = {
   temperature: 'Temperature',
   humidity:    'Humidity',
   pressure:    'Pressure',
   voc:         'VOC Index',
   nox:         'NOx Index',
-  pm25:        'PM2.5',
   water:       'Water',
 };
 
@@ -28,9 +30,36 @@ const Y_RANGES = {
 
 // Keys shown as tiles on the Live tab. Note `airquality` is synthetic —
 // derived from voc + nox so students see a single clear rating instead of
-// two raw index numbers.
-const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'pm25', 'water'];
+// two raw index numbers. (PM2.5 temporarily removed; see SENSOR_LABELS above.)
+const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'water'];
 const LIVE_TILE_LABELS = { ...SENSOR_LABELS, airquality: 'Air Quality' };
+
+// Generate explicit X-axis tick timestamps at every midnight (00:00) and
+// every noon (12:00) inside the visible data range. The tickFormatter below
+// renders midnight ticks as the date (e.g. "May 11") and noon ticks as "12h",
+// giving the History charts the date / 12h / next-date / 12h cadence.
+function ticksEvery12h(min, max) {
+  if (!min || !max || max - min < 60 * 60 * 1000) return undefined; // <1h: let Recharts auto-pick
+  const HALF_DAY = 12 * 60 * 60 * 1000;
+  const start = new Date(min);
+  start.setMinutes(0, 0, 0);
+  start.setHours(start.getHours() < 12 ? 0 : 12);
+  let t = start.getTime();
+  const ticks = [];
+  while (t <= max) {
+    if (t >= min) ticks.push(t);
+    t += HALF_DAY;
+  }
+  return ticks.length > 0 ? ticks : undefined;
+}
+
+function format12hTick(t) {
+  const d = new Date(t);
+  if (d.getHours() === 0) {
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+  return '12h';
+}
 
 // Pretty-print sensor units. Firmware sends plain "F" / "C" / "%" — we map
 // the thermal ones to include the degree symbol so the tile reads naturally.
@@ -198,7 +227,8 @@ export default function DevicePage() {
                         type="number"
                         domain={['dataMin', 'dataMax']}
                         scale="time"
-                        tickFormatter={t => new Date(t).toLocaleTimeString()}
+                        ticks={ticksEvery12h(data[0]?.ts, data[data.length - 1]?.ts)}
+                        tickFormatter={format12hTick}
                       />
                       <YAxis domain={Y_RANGES[k] || ['auto', 'auto']} allowDataOverflow />
                       <Tooltip labelFormatter={t => new Date(t).toLocaleString()} />
