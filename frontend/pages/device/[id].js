@@ -21,19 +21,21 @@ const SENSOR_LABELS = {
 // to reject clearly broken readings); here we tighten each axis to the typical
 // real-world range so day-to-day variation is actually visible on the chart.
 const Y_RANGES = {
-  temperature: [60, 100],   // °F, typical indoor + outdoor in Ghana
-  humidity:    [0, 100],    // %RH, natural full range
-  pressure:    [300, 1200], // hPa, matches the firmware's full sanity-check range (user-requested)
-  voc:         [0, 500],    // Sensirion gas index
-  nox:         [0, 500],    // Sensirion gas index
+  temperature: [0, 130],    // °F, broad ambient range
+  humidity:    [10, 100],   // %RH, clipped low-end (sensor floor)
+  pressure:    [300, 1200], // hPa, matches the firmware's full sanity-check range
+  voc:         [0, 500],    // Sensirion gas index (full scale)
+  nox:         [0, 5],      // NOx index zoomed to typical clean-air range
   pm25:        [0, 100],    // ug/m3
   water:       [0, 1023],   // raw ADC
 };
 
-// Keys shown as tiles on the Live tab. Note `airquality` is synthetic —
-// derived from voc + nox so students see a single clear rating instead of
-// two raw index numbers. (PM2.5 temporarily removed; see SENSOR_LABELS above.)
-const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'water'];
+// Keys shown as tiles on the Live tab. `airquality` is the synthetic combined
+// rating (Good/Moderate/Poor/Unhealthy/Severe) derived from voc + nox; `voc`
+// and `nox` show the raw Sensirion index values alongside it so students can
+// see both the headline rating and the underlying numbers. (PM2.5 temporarily
+// hidden; see SENSOR_LABELS above.)
+const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'voc', 'nox', 'water'];
 const LIVE_TILE_LABELS = { ...SENSOR_LABELS, airquality: 'Air Quality' };
 
 // Generate explicit X-axis tick timestamps at every midnight (00:00) and
