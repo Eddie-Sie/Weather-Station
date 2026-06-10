@@ -1,4 +1,3 @@
-
 /*
  * Community Weather Station — ESP8266 firmware
  *
@@ -28,7 +27,7 @@
  * Board: "Generic ESP8266 Module" or your specific ESP8266 board, with
  * Flash Size set to include a LittleFS filesystem (e.g. "4MB FS:1MB").
  */
- 
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
@@ -38,21 +37,21 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include <time.h>
- 
+
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_DPS310.h>
 #include <SensirionI2CSgp41.h>
 #include <NOxGasIndexAlgorithm.h>
 #include <VOCGasIndexAlgorithm.h>
 #include <Seeed_HM330X.h>
- 
+
 // ===== EDIT ME BEFORE FLASHING =============================================
 // The base URL of your deployed backend. During local testing use your
 // computer's LAN IP (e.g. http://192.168.1.20:4000). In production use
 // the https URL of your Render deployment (see docs/05-deploying-online.md).
 #define API_BASE_URL "https://weather-station-api-9zq4.onrender.com"
 // ===========================================================================
- 
+
 #define READ_INTERVAL_MS     60000   // 60 seconds
 #define REPROBE_EVERY_N      2       // re-run setupSensors() every 2 cycles (helps the I²C extension catch sensors that didn't enumerate on cold boot)
 #define BUFFER_FILE          "/buffer.jsonl"
@@ -63,7 +62,7 @@
 #define DNS_PORT             53
 #define MAX_BUFFER_BYTES     150000  // ~150 KB of readings before we stop appending
 #define AP_FALLBACK_AFTER_MS 10000   // 10 seconds — if WiFi hasn't connected by then, bring up the portal as a fallback so students can reconfigure
- 
+
 // ===== BATTERY SAVER (deep sleep) ==========================================
 // When SLEEP_MODE_ENABLED is true, the board wakes, takes ONE reading, sends it
 // (or buffers it to flash if WiFi is down), then deep-sleeps for
@@ -88,7 +87,7 @@
 // Readings around 250 are typical "dry air" noise on the Grove water sensor.
 // Increase WATER_RAIN_THRESHOLD if you get false positives in humid air.
 #define WATER_RAIN_THRESHOLD 210
- 
+
 // ---- Globals --------------------------------------------------------------
 Adafruit_AHTX0       aht;
 Adafruit_DPS310      dps;
@@ -96,16 +95,16 @@ SensirionI2CSgp41    sgp41;
 VOCGasIndexAlgorithm voc_algo;
 NOxGasIndexAlgorithm nox_algo;
 HM330X               hm3301;
- 
+
 bool have_aht    = false;
 bool have_dps    = false;
 bool have_sgp41  = false;
 bool have_hm3301 = false;
- 
+
 ESP8266WebServer portalServer(80);
 DNSServer        dnsServer;
 bool             inProvisioningMode = false;
- 
+
 struct Config {
   String wifiSsid;
   String wifiPass;
@@ -115,7 +114,7 @@ struct Config {
   float  longitude = 0;
   String deviceToken;   // returned by server after first successful register
 } cfg;
- 
+
 String deviceId;
 unsigned long lastReadAt = 0;
 unsigned long lastWifiRetryAt = 0;
@@ -128,7 +127,7 @@ int32_t cachedVocIdx = 0;
 int32_t cachedNoxIdx = 0;
 bool     sgpReady    = false;       // true once we have real samples flowing
 bool clockSynced = false;
- 
+
 // ---- Forward declarations -------------------------------------------------
 void   loadConfig();
 void   saveConfig();
@@ -149,25 +148,25 @@ void   syncClock();
 String macSuffix();
 void   doOneMeasurementCycle();
 void   goToDeepSleep();
- 
+
 // ===== SETUP ===============================================================
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
   Serial.println(F("=== Community Weather Station booting ==="));
- 
+
   deviceId = "WN-" + macSuffix();
   Serial.printf("Device ID: %s\n", deviceId.c_str());
   Serial.printf("Fallback AP name: WeatherNode-%s   password: %s\n", macSuffix().c_str(), AP_PASSWORD);
   Serial.println(F("(If WiFi isn't reachable for ~10 seconds, this AP will appear automatically.)"));
- 
+
   if (!LittleFS.begin()) {
     Serial.println(F("LittleFS mount failed, formatting..."));
     LittleFS.format();
     LittleFS.begin();
   }
- 
+
   Wire.begin();             // ESP8266 default: SDA=GPIO4 (D2), SCL=GPIO5 (D1)
   // 50 kHz instead of the default 100 kHz. The cabled Grove I²C extension adds
   // capacitance, slows down the rising edge, and makes far sensors (PM2.5 +
@@ -176,7 +175,7 @@ void setup() {
   Wire.setClock(50000);
   delay(100);               // let the bus settle before we probe sensors
   setupSensors();
- 
+
   // ---- Factory reset: tap RST, then press & hold FLASH for ~3s ------------
   // GPIO0 (the FLASH button) is ALSO the chip's boot-mode strapping pin, so
   // it cannot be held during the RST press itself — that would trick the chip
@@ -237,15 +236,15 @@ void setup() {
       }
     }
   }
- 
+
   loadConfig();
- 
+
   if (cfg.wifiSsid.length() == 0 || cfg.pairingCode.length() == 0) {
     Serial.println(F("No saved config — entering provisioning mode."));
     startProvisioningPortal();
     return;   // stay in portal mode, loop() will handle requests
   }
- 
+
   // Try to join the saved WiFi.
   bool wifiOk = connectToWifi();
   if (wifiOk) {
@@ -255,7 +254,7 @@ void setup() {
   } else {
     Serial.println(F("Could not join saved WiFi this wake."));
   }
- 
+
   if (SLEEP_MODE_ENABLED) {
     // ---- Battery-saver path: take ONE reading, then deep-sleep. ----
     // If WiFi joined, we send the reading (and flush anything that piled up in
@@ -268,14 +267,14 @@ void setup() {
     doOneMeasurementCycle();
     goToDeepSleep();            // never returns — board reboots when D0 pulses RST
   }
- 
+
   // ---- Original always-on path (only reached when SLEEP_MODE_ENABLED is false) ----
   if (!wifiOk) {
     Serial.println(F("Will keep retrying from loop()."));
   }
   lastReadAt = millis() - READ_INTERVAL_MS;   // force an immediate first reading
 }
- 
+
 // ===== LOOP ================================================================
 void loop() {
   if (inProvisioningMode) {
@@ -283,7 +282,7 @@ void loop() {
     portalServer.handleClient();
     return;
   }
- 
+
   // Background WiFi retry: if we lost (or never got) a connection, try
   // once every 30 seconds without blocking the rest of the loop.
   if (WiFi.status() != WL_CONNECTED) {
@@ -334,7 +333,7 @@ void loop() {
       registerDeviceIfNeeded();
     }
   }
- 
+
   // The Sensirion gas-index algorithm is designed for 1 Hz sampling. If we
   // only poll once per 60 s the algorithm never converges and VOC/NOx stay
   // at 0 forever. So we tick SGP41 every second here and cache the index.
@@ -342,20 +341,20 @@ void loop() {
     lastSgpTickAt = millis();
     tickSgp41();
   }
- 
+
   if (millis() - lastReadAt >= READ_INTERVAL_MS) {
     lastReadAt = millis();
- 
+
     // Every few cycles, re-probe sensors so mid-run unplugs or reconnects are detected.
     if ((cycleCounter++ % REPROBE_EVERY_N) == 0) setupSensors();
- 
+
     StaticJsonDocument<1024> doc;
     readAll(doc);
- 
+
     String body;
     serializeJson(doc, body);
     Serial.println(body);
- 
+
     if (WiFi.status() == WL_CONNECTED && postReading(body)) {
       flushBuffer();
     } else {
@@ -363,7 +362,7 @@ void loop() {
     }
   }
 }
- 
+
 // ===== BATTERY-SAVER HELPERS ===============================================
 // One complete measurement: (re)init sensors, warm up the gas sensor, read
 // everything, then either POST it (and flush the offline buffer) or buffer it
@@ -373,7 +372,7 @@ void doOneMeasurementCycle() {
   // give the I²C bus a moment to settle before reading.
   setupSensors();
   delay(200);
- 
+
   // The SGP41 VOC/NOx gas-index algorithm needs a short warm-up on every cold
   // start. We tick it once per second for SGP_WARMUP_SECS. NOTE: because the
   // board cold-boots each wake, the algorithm can't build its usual long-term
@@ -385,21 +384,21 @@ void doOneMeasurementCycle() {
     delay(1000);
     yield();
   }
- 
+
   StaticJsonDocument<1024> doc;
   readAll(doc);
- 
+
   String body;
   serializeJson(doc, body);
   Serial.println(body);
- 
+
   if (WiFi.status() == WL_CONNECTED && postReading(body)) {
     flushBuffer();
   } else {
     bufferReading(body);
   }
 }
- 
+
 // Put the chip into deep sleep for SLEEP_DURATION_MIN minutes. It wakes via the
 // D0 (GPIO16) -> RST jumper, which triggers a full reboot back into setup().
 // This function does not return — execution stops here until the next wake.
@@ -410,7 +409,7 @@ void goToDeepSleep() {
   ESP.deepSleep(us);            // RF_DEFAULT: radio comes back on after wake so WiFi works
   delay(100);                   // never reached; keeps some toolchains happy
 }
- 
+
 // ===== SENSOR INIT =========================================================
 // Only tries to init sensors that are currently missing — working sensors are
 // left alone so we don't disturb them. Called at boot and on the re-probe
@@ -445,14 +444,14 @@ void setupSensors() {
   }
   pinMode(WATER_PIN, INPUT);
 }
- 
+
 // Must be called ~once per second. First 10 ticks run executeConditioning()
 // (hot-plate conditioning as Sensirion specifies); after that we switch to
 // measureRawSignals() and feed the gas-index algorithm so VOC/NOx produce
 // real 0..500 values instead of staying at 0.
 void tickSgp41() {
   if (!have_sgp41) return;
- 
+
   // Pull the latest temperature + humidity for sensor compensation.
   uint16_t rhTicks = 0x8000;   // default 50% RH
   uint16_t tTicks  = 0x6666;   // default 25 C
@@ -463,7 +462,7 @@ void tickSgp41() {
       tTicks  = (uint16_t)(((tempEvt.temperature + 45) * 65535) / 175);
     }
   }
- 
+
   if (sgpConditioningSecs < 10) {
     uint16_t rawVoc = 0;
     uint16_t err = sgp41.executeConditioning(rhTicks, tTicks, rawVoc);
@@ -472,7 +471,7 @@ void tickSgp41() {
     if (sgpConditioningSecs == 10) Serial.println(F("SGP41 conditioning complete, switching to measurement."));
     return;
   }
- 
+
   uint16_t rawVoc = 0, rawNox = 0;
   uint16_t err = sgp41.measureRawSignals(rhTicks, tTicks, rawVoc, rawNox);
   if (err != 0) {
@@ -483,13 +482,13 @@ void tickSgp41() {
   cachedNoxIdx = nox_algo.process(rawNox);
   sgpReady = true;
 }
- 
+
 // ===== READ ALL SENSORS INTO A JSON DOC ====================================
 bool readAll(StaticJsonDocument<1024>& doc) {
   doc["device_id"] = deviceId;
   doc["ts"]        = (uint32_t) time(nullptr);
   JsonObject s     = doc.createNestedObject("sensors");
- 
+
   // ---- AHT20 (temperature + humidity) ----
   {
     JsonObject t = s.createNestedObject("temperature");
@@ -514,7 +513,7 @@ bool readAll(StaticJsonDocument<1024>& doc) {
       t["status"] = "disconnected"; h["status"] = "disconnected";
     }
   }
- 
+
   // ---- DPS310 (pressure) ----
   {
     JsonObject p = s.createNestedObject("pressure");
@@ -541,7 +540,7 @@ bool readAll(StaticJsonDocument<1024>& doc) {
       p["status"] = "disconnected";
     }
   }
- 
+
   // ---- SGP41 (VOC + NOx index) ----
   // The sensor is now sampled every ~1 second from tickSgp41() in loop().
   // Here we just report the cached index the algorithm has converged on.
@@ -559,10 +558,19 @@ bool readAll(StaticJsonDocument<1024>& doc) {
       n["value"] = cachedNoxIdx; n["unit"] = "index"; n["status"] = "ok";
     }
   }
- 
+
   // ---- HM3301 (PM2.5 etc) ----
   {
     JsonObject pm = s.createNestedObject("pm25");
+    // Late re-probe: the HM3301's laser/fan needs ~1s after cold boot before
+    // its I²C front-end will reliably ACK, which is longer than the gap
+    // between board boot and the original setupSensors() call. By the time
+    // we get here (after the 60s SGP41 warm-up) the sensor is definitely
+    // ready, so retrying init() now either succeeds and unlocks a real
+    // reading, or honestly confirms the cable is unplugged.
+    if (!have_hm3301) {
+      have_hm3301 = (hm3301.init() == NO_ERROR);
+    }
     if (have_hm3301) {
       uint8_t buf[30];
       if (hm3301.read_sensor_value(buf, 29) == NO_ERROR) {
@@ -573,12 +581,13 @@ bool readAll(StaticJsonDocument<1024>& doc) {
         pm["status"] = "ok";
       } else {
         pm["status"] = "error";
+        have_hm3301 = false;       // force a clean re-probe next cycle
       }
     } else {
       pm["status"] = "disconnected";
     }
   }
- 
+
   // ---- Water sensor (analog A0) ----
   {
     JsonObject w = s.createNestedObject("water");
@@ -589,10 +598,10 @@ bool readAll(StaticJsonDocument<1024>& doc) {
     w["state"]  = (raw <= WATER_RAIN_THRESHOLD) ? "raining" : "clear";
     // Higher raw reading = wetter. Threshold is WATER_RAIN_THRESHOLD above.
   }
- 
+
   return true;
 }
- 
+
 // ===== NETWORKING ==========================================================
 bool connectToWifi() {
   // Clear any stale state from AP mode / previous boot
@@ -623,7 +632,7 @@ bool connectToWifi() {
   Serial.printf("WiFi status after timeout: %d\n", WiFi.status());
   return false;
 }
- 
+
 void syncClock() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print(F("Waiting for NTP"));
@@ -631,20 +640,20 @@ void syncClock() {
   for (int i = 0; i < 30 && now < 100000; ++i) { delay(500); Serial.print('.'); now = time(nullptr); }
   Serial.println();
 }
- 
+
 bool registerDeviceIfNeeded() {
   if (cfg.deviceToken.length() > 0) return true;
- 
+
   StaticJsonDocument<512> doc;
   doc["device_id"]     = deviceId;
   doc["pairing_code"]  = cfg.pairingCode;
   doc["location_name"] = cfg.locationName;
   doc["latitude"]      = cfg.latitude;
   doc["longitude"]     = cfg.longitude;
- 
+
   String body;
   serializeJson(doc, body);
- 
+
   String url = String(API_BASE_URL) + "/api/devices/register";
   HTTPClient http;
   WiFiClient          plainClient;
@@ -676,10 +685,10 @@ bool registerDeviceIfNeeded() {
   http.end();
   return false;
 }
- 
+
 bool postReading(const String& body) {
   if (cfg.deviceToken.length() == 0 && !registerDeviceIfNeeded()) return false;
- 
+
   String url = String(API_BASE_URL) + "/api/readings";
   HTTPClient http;
   WiFiClient          plainClient;
@@ -703,7 +712,7 @@ bool postReading(const String& body) {
   Serial.printf("POST /api/readings -> %d\n", code);
   return code >= 200 && code < 300;
 }
- 
+
 // ===== OFFLINE BUFFER ======================================================
 void bufferReading(const String& body) {
   File f = LittleFS.open(BUFFER_FILE, "a");
@@ -718,10 +727,10 @@ void bufferReading(const String& body) {
   f.close();
   Serial.println(F("Reading buffered to flash."));
 }
- 
+
 void flushBuffer() {
   if (!LittleFS.exists(BUFFER_FILE)) return;
- 
+
   // First pass: count the readings so we can backfill timestamps for any that
   // were buffered while NTP was offline. Those records carry ts == 0 (the
   // ESP8266 returns 0 from time() before configTime() has succeeded), which
@@ -742,16 +751,16 @@ void flushBuffer() {
     fc.close();
   }
   if (totalReadings == 0) { LittleFS.remove(BUFFER_FILE); return; }
- 
+
   Serial.println(F("Flushing buffered readings..."));
- 
+
   const uint32_t nowSec      = (uint32_t) time(nullptr);
   const uint32_t intervalSec = (uint32_t) SLEEP_DURATION_MIN * 60UL;
   const bool     clockOk     = (nowSec > 1000000000UL);   // anything past year 2001 = NTP definitely synced
- 
+
   File f = LittleFS.open(BUFFER_FILE, "r");
   if (!f) return;
- 
+
   int   flushed = 0;
   int   idx     = 0;
   bool  allOk   = true;
@@ -760,7 +769,7 @@ void flushBuffer() {
     line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
- 
+
     // If this buffered reading's timestamp is bogus (was buffered while NTP
     // was offline), rewrite it based on its chronological position so it
     // lands at a sensible point on the dashboard chart instead of at 1970.
@@ -777,7 +786,7 @@ void flushBuffer() {
         serializeJson(doc, line);
       }
     }
- 
+
     if (!postReading(line)) { allOk = false; break; }
     flushed++;
     idx++;
@@ -791,7 +800,7 @@ void flushBuffer() {
     Serial.printf("Flush interrupted after %d readings; will retry next cycle.\n", flushed);
   }
 }
- 
+
 // ===== CONFIG PERSISTENCE ==================================================
 void loadConfig() {
   if (!LittleFS.exists(CONFIG_FILE)) return;
@@ -808,7 +817,7 @@ void loadConfig() {
   cfg.deviceToken  = (const char*)(d["deviceToken"]  | "");
   f.close();
 }
- 
+
 void saveConfig() {
   StaticJsonDocument<512> d;
   d["wifiSsid"]     = cfg.wifiSsid;
@@ -822,11 +831,11 @@ void saveConfig() {
   serializeJson(d, f);
   f.close();
 }
- 
+
 // ===== CAPTIVE PORTAL ======================================================
 // The HTML page is in portal.h to keep this file shorter.
 #include "portal.h"
- 
+
 void startProvisioningPortal() {
   inProvisioningMode = true;
   WiFi.mode(WIFI_AP);
@@ -834,9 +843,9 @@ void startProvisioningPortal() {
   WiFi.softAP(apName.c_str(), AP_PASSWORD);
   Serial.printf("AP up: %s  pass: %s\n", apName.c_str(), AP_PASSWORD);
   Serial.print(F("Portal IP: ")); Serial.println(WiFi.softAPIP());
- 
+
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
- 
+
   portalServer.on("/",        handlePortalRoot);
   portalServer.on("/save",    HTTP_POST, handlePortalSave);
   portalServer.on("/status",  handlePortalStatus);
@@ -844,7 +853,7 @@ void startProvisioningPortal() {
   portalServer.onNotFound(    handlePortalRoot);   // captive portal catch-all
   portalServer.begin();
 }
- 
+
 // Returns visible 2.4GHz networks as JSON so the portal page can show a
 // pickable list. Crucial for students whose router broadcasts 5GHz networks
 // (which the ESP8266 cannot see at all).
@@ -866,16 +875,16 @@ void handlePortalScan() {
   WiFi.mode(WIFI_AP);   // back to AP-only so the portal stays responsive
   portalServer.send(200, "application/json", j);
 }
- 
+
 void handlePortalRoot() {
   portalServer.send_P(200, "text/html", PORTAL_HTML);
 }
- 
+
 void handlePortalStatus() {
   String j = "{\"deviceId\":\"" + deviceId + "\"}";
   portalServer.send(200, "application/json", j);
 }
- 
+
 void handlePortalSave() {
   cfg.wifiSsid     = portalServer.arg("ssid");
   cfg.wifiPass     = portalServer.arg("pass");
@@ -890,7 +899,7 @@ void handlePortalSave() {
   delay(1500);
   ESP.restart();
 }
- 
+
 // ===== UTIL ================================================================
 String macSuffix() {
   uint8_t mac[6];
@@ -899,4 +908,3 @@ String macSuffix() {
   snprintf(buf, sizeof(buf), "%02X%02X%02X", mac[3], mac[4], mac[5]);
   return String(buf);
 }
-
