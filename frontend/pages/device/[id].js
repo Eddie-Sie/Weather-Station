@@ -4,15 +4,13 @@ import Link from 'next/link';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { api } from '../../lib/api';
 
-// NOTE: PM2.5 (HM3301) is temporarily hidden from the UI while we sort out
-// reliability on the I²C extension. Backend still records it; to bring it
-// back, restore the `pm25: 'PM2.5'` entry here AND in LIVE_TILE_KEYS below.
 const SENSOR_LABELS = {
   temperature: 'Temperature',
   humidity:    'Humidity',
   pressure:    'Pressure',
   voc:         'VOC Index',
   nox:         'NOx Index',
+  pm25:        'PM2.5',
   water:       'Water',
 };
 
@@ -33,9 +31,9 @@ const Y_RANGES = {
 // Keys shown as tiles on the Live tab. `airquality` is the synthetic combined
 // rating (Good/Moderate/Poor/Unhealthy/Severe) derived from voc + nox; `voc`
 // and `nox` show the raw Sensirion index values alongside it so students can
-// see both the headline rating and the underlying numbers. (PM2.5 temporarily
-// hidden; see SENSOR_LABELS above.)
-const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'voc', 'nox', 'water'];
+// see both the headline rating and the underlying numbers. PM2.5 is the
+// HM3301 particulate reading in µg/m³.
+const LIVE_TILE_KEYS = ['temperature', 'humidity', 'pressure', 'airquality', 'voc', 'nox', 'pm25', 'water'];
 const LIVE_TILE_LABELS = { ...SENSOR_LABELS, airquality: 'Air Quality' };
 
 // Generate explicit X-axis tick timestamps at every midnight (00:00) and
