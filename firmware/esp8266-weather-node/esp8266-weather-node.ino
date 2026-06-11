@@ -49,7 +49,7 @@
 // The base URL of your deployed backend. During local testing use your
 // computer's LAN IP (e.g. http://192.168.1.20:4000). In production use
 // the https URL of your Render deployment (see docs/05-deploying-online.md).
-#define API_BASE_URL "https://weather-station-api-9zq4.onrender.com"
+#define API_BASE_URL "https://weather-backend-3u7r.onrender.com"
 // ===========================================================================
 
 #define READ_INTERVAL_MS     60000   // 60 seconds
