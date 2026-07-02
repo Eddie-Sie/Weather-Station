@@ -64,10 +64,10 @@
 #define AP_FALLBACK_AFTER_MS 10000   // 10 seconds — if WiFi hasn't connected by then, bring up the portal as a fallback so students can reconfigure
 
 // ===== BATTERY SAVER (deep sleep) ==========================================
-// When SLEEP_MODE_ENABLED is true, the board wakes, takes ONE reading, sends it
-// (or buffers it to flash if WiFi is down), then deep-sleeps for
-// SLEEP_DURATION_MIN minutes — repeating forever. This is what turns a ~20-hour
-// battery run into several days.
+// When SLEEP_MODE_ENABLED is true, the board wakes and stays up for a
+// ~10-minute awake window, sending one reading per minute (10 readings) —
+// posting each one live, or buffering it to flash if WiFi is down — then
+// deep-sleeps for SLEEP_DURATION_MIN minutes and repeats forever.
 //
 // HARDWARE REQUIREMENT: you MUST connect pin D0 (GPIO16) to RST with a jumper
 // wire, or the board will go to sleep and never wake up. IMPORTANT: remove that
@@ -81,8 +81,13 @@
 // Set SLEEP_MODE_ENABLED to false to return to the original always-on behaviour
 // (handy when debugging on USB power, where battery life doesn't matter).
 #define SLEEP_MODE_ENABLED   true
-#define SLEEP_DURATION_MIN   5     // minutes asleep between readings
-#define SGP_WARMUP_SECS      60    // seconds to warm up the VOC/NOx sensor each wake before reading it (the SGP41 gas-index algorithm needs a full minute of conditioning at 1 Hz to settle on a meaningful value; set to 0 to skip VOC/NOx and save the most battery)
+#define SLEEP_DURATION_MIN   5     // minutes asleep between awake windows
+// CHANGED: instead of one reading per wake, stay awake for AWAKE_READINGS
+// minutes, sending one reading per minute, THEN deep-sleep for
+// SLEEP_DURATION_MIN minutes. (10 readings x 1 min = 10-minute awake window.)
+#define AWAKE_READINGS       10    // readings per awake window (one per minute)
+#define READING_GAP_SECS     60    // seconds between readings while awake
+#define SGP_WARMUP_SECS      60    // (superseded: the first minute of every awake window now doubles as the SGP41 warm-up, so this constant is no longer used by the sleep-mode cycle)
 // Water sensor thresholds (ESP8266 ADC range 0..1023).
 // Readings around 250 are typical "dry air" noise on the Grove water sensor.
 // Increase WATER_RAIN_THRESHOLD if you get false positives in humid air.
@@ -256,12 +261,13 @@ void setup() {
   }
 
   if (SLEEP_MODE_ENABLED) {
-    // ---- Battery-saver path: take ONE reading, then deep-sleep. ----
-    // If WiFi joined, we send the reading (and flush anything that piled up in
-    // the offline buffer while we were away). If it didn't join, we simply
-    // buffer this reading to flash and retry on the next wake — we deliberately
-    // do NOT sit awake in AP mode here, because that keeps the radio on and
-    // burns the battery we're trying to save. To reconfigure WiFi after
+    // ---- Battery-saver path: 10-minute awake window, then deep-sleep. ----
+    // doOneMeasurementCycle() sends one reading per minute for AWAKE_READINGS
+    // minutes (posting live when WiFi + clock are good, buffering to flash
+    // otherwise, and flushing any backlog on each successful post). If WiFi
+    // is down it now retries the saved network every 30s during the window,
+    // but we deliberately do NOT sit awake in AP portal mode here, because
+    // that keeps the radio busy and burns battery. To reconfigure WiFi after
     // deployment, hold the FLASH button and tap RST (keep FLASH held ~3s) to
     // factory-reset into the setup portal, which stays awake.
     doOneMeasurementCycle();
@@ -373,29 +379,70 @@ void doOneMeasurementCycle() {
   setupSensors();
   delay(200);
 
-  // The SGP41 VOC/NOx gas-index algorithm needs a short warm-up on every cold
-  // start. We tick it once per second for SGP_WARMUP_SECS. NOTE: because the
-  // board cold-boots each wake, the algorithm can't build its usual long-term
-  // baseline, so VOC/NOx are LESS ACCURATE in sleep mode. Temperature,
-  // humidity and pressure are unaffected. (Set SGP_WARMUP_SECS to 0 to skip
-  // this warm-up entirely and save the most battery.)
-  for (uint16_t i = 0; i < SGP_WARMUP_SECS; ++i) {
-    tickSgp41();
-    delay(1000);
-    yield();
-  }
+  // CHANGED: the whole awake window now runs on a fixed schedule. Reading r
+  // fires at (r+1) * READING_GAP_SECS after windowStart — i.e. at minutes
+  // 1, 2, ... 10. Because each slot is an absolute time, slow network POSTs
+  // can no longer stretch the window (no drift): total awake time is a true
+  // ~10 minutes. The one-minute wait before the FIRST reading doubles as the
+  // SGP41 warm-up (we tick it once per second for the entire window), so
+  // every reading — including the first — has a converged VOC/NOx value and
+  // the separate SGP_WARMUP_SECS delay is no longer needed.
+  const unsigned long windowStart  = millis();
+  unsigned long       lastWifiKick = 0;
+  unsigned long       lastClockTry = 0;
 
-  StaticJsonDocument<1024> doc;
-  readAll(doc);
+  for (uint8_t r = 0; r < AWAKE_READINGS; ++r) {
+    const unsigned long dueAt = (unsigned long)(r + 1) * (unsigned long)READING_GAP_SECS * 1000UL;
 
-  String body;
-  serializeJson(doc, body);
-  Serial.println(body);
+    // Wait for this reading's slot, doing once-per-second background upkeep.
+    while (millis() - windowStart < dueAt) {
+      tickSgp41();
 
-  if (WiFi.status() == WL_CONNECTED && postReading(body)) {
-    flushBuffer();
-  } else {
-    bufferReading(body);
+      if (WiFi.status() != WL_CONNECTED) {
+        // CHANGED: if WiFi drops (or never joined at boot), keep retrying the
+        // SAVED network every 30 seconds instead of giving up for the rest of
+        // the window. Uses the same SSID + password from the stored config —
+        // nothing about the connection or backend is altered.
+        if (millis() - lastWifiKick > 30000UL) {
+          lastWifiKick = millis();
+          Serial.println(F("WiFi down mid-window - retrying saved network..."));
+          WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+        }
+      } else if (!clockSynced && millis() - lastClockTry > 30000UL) {
+        // CHANGED: WiFi came up mid-window but the clock never synced at boot.
+        // Sync + register NOW — otherwise live-posted readings would carry
+        // ts=0, be stored as January 1970, and never appear on the dashboard.
+        lastClockTry = millis();
+        syncClock();
+        clockSynced = (time(nullptr) > 100000);
+        registerDeviceIfNeeded();
+      }
+
+      delay(1000);
+      yield();
+    }
+
+    // CHANGED: re-probe sensors every few readings so a mid-window unplug or
+    // replug is detected — mirrors the always-on loop() path's REPROBE_EVERY_N
+    // behaviour. (Only missing sensors are probed; working ones are untouched.)
+    if ((r % REPROBE_EVERY_N) == 0) setupSensors();
+
+    StaticJsonDocument<1024> doc;
+    readAll(doc);
+
+    String body;
+    serializeJson(doc, body);
+    Serial.println(body);
+
+    // CHANGED: only POST live when the clock is synced. If WiFi is up but NTP
+    // never succeeded, the reading would arrive stamped 1970 and vanish from
+    // the dashboard — buffering it instead lets flushBuffer() backfill a
+    // sensible timestamp once the clock is good.
+    if (WiFi.status() == WL_CONNECTED && clockSynced && postReading(body)) {
+      flushBuffer();
+    } else {
+      bufferReading(body);
+    }
   }
 }
 
@@ -736,8 +783,11 @@ void flushBuffer() {
   // ESP8266 returns 0 from time() before configTime() has succeeded), which
   // would otherwise be stored as January 1970 and never show up on the
   // dashboard chart. The buffer is written chronologically (oldest first), so
-  // we assume each buffered reading is one SLEEP_DURATION_MIN cycle apart and
-  // walk backwards from "now" to assign plausible timestamps.
+  // we walk backwards from "now" to assign plausible timestamps. CHANGED:
+  // readings are no longer evenly spaced — they come in windows of
+  // AWAKE_READINGS readings, READING_GAP_SECS apart, separated by a sleep
+  // (plus SGP warm-up) gap. The backfill below assumes the newest buffered
+  // reading closed out a window and walks backwards with that pattern.
   int totalReadings = 0;
   {
     File fc = LittleFS.open(BUFFER_FILE, "r");
@@ -754,9 +804,12 @@ void flushBuffer() {
 
   Serial.println(F("Flushing buffered readings..."));
 
-  const uint32_t nowSec      = (uint32_t) time(nullptr);
-  const uint32_t intervalSec = (uint32_t) SLEEP_DURATION_MIN * 60UL;
-  const bool     clockOk     = (nowSec > 1000000000UL);   // anything past year 2001 = NTP definitely synced
+  const uint32_t nowSec        = (uint32_t) time(nullptr);
+  // CHANGED: two gap sizes instead of one flat interval.
+  const uint32_t readingGapSec = (uint32_t) READING_GAP_SECS;
+  const uint32_t sleepGapSec   = (uint32_t) SLEEP_DURATION_MIN * 60UL
+                               + (uint32_t) READING_GAP_SECS;   // sleep + the warm-up minute before a window's first reading
+  const bool     clockOk       = (nowSec > 1000000000UL);   // anything past year 2001 = NTP definitely synced
 
   File f = LittleFS.open(BUFFER_FILE, "r");
   if (!f) return;
@@ -780,8 +833,14 @@ void flushBuffer() {
     if (!err) {
       uint32_t ts = doc["ts"] | 0UL;
       if (clockOk && ts < 1000000000UL) {
-        uint32_t hopsBack = (uint32_t)(totalReadings - idx);   // newest in buffer = 1 cycle ago
-        doc["ts"] = nowSec - hopsBack * intervalSec;
+        // CHANGED: walking back from "now", each hop is normally one
+        // READING_GAP_SECS (a minute), but every AWAKE_READINGS hops we cross
+        // a sleep boundary, which is a sleepGapSec hop instead. sleepsBack
+        // counts how many of the hops are sleep boundaries.
+        uint32_t hopsBack   = (uint32_t)(totalReadings - idx);   // newest in buffer = 1 reading-gap ago
+        uint32_t sleepsBack = (hopsBack - 1) / (uint32_t) AWAKE_READINGS;
+        doc["ts"] = nowSec - hopsBack * readingGapSec
+                           - sleepsBack * (sleepGapSec - readingGapSec);
         line = "";
         serializeJson(doc, line);
       }
