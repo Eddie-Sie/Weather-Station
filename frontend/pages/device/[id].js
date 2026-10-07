@@ -306,25 +306,38 @@ function SettingsPanel({ deviceId, device, onSaved }) {
   const [saved,     setSaved]           = useState(false);
   const [err,       setErr]             = useState('');
 
-  function useMyLocation() {
+  async function useMyLocation() {
     if (!navigator.geolocation) {
-      setGeoStatus('Geolocation is not supported by this browser.');
+      setGeoStatus('error:Geolocation is not supported by this browser.');
       return;
     }
-    setGeoStatus('Getting location…');
+
+    // Check permission state before trying — avoids silent failures when
+    // the user previously clicked "Block" and the browser won't ask again.
+    if (navigator.permissions) {
+      try {
+        const perm = await navigator.permissions.query({ name: 'geolocation' });
+        if (perm.state === 'denied') {
+          setGeoStatus('error:Location access is blocked. To fix it: click the 🔒 lock icon in your browser\'s address bar → Site settings → Location → Allow, then refresh the page and try again.');
+          return;
+        }
+      } catch (_) { /* permissions API not supported — carry on */ }
+    }
+
+    setGeoStatus('loading:Getting your location…');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setLat(pos.coords.latitude.toFixed(6));
         setLon(pos.coords.longitude.toFixed(6));
-        setGeoStatus('Location filled in — click Save to store it.');
+        setGeoStatus('success:Location filled in — click Save to store it.');
       },
       (error) => {
         const msgs = {
-          1: 'Permission denied. Please allow location access in your browser settings, then try again.',
-          2: 'Position unavailable. Make sure location services are enabled on this device.',
-          3: 'Timed out waiting for location. Please try again.',
+          1: 'error:Location access was denied. Click the 🔒 lock icon in your browser\'s address bar → Site settings → Location → Allow, then refresh and try again.',
+          2: 'error:Your device couldn\'t determine its position. Make sure location services are enabled in your phone/computer settings.',
+          3: 'error:Timed out waiting for location. Move to an area with better GPS signal and try again.',
         };
-        setGeoStatus(msgs[error.code] || 'Could not get location: ' + error.message);
+        setGeoStatus(msgs[error.code] || 'error:Could not get location: ' + error.message);
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
@@ -376,11 +389,20 @@ function SettingsPanel({ deviceId, device, onSaved }) {
                   className="text-sm bg-slate-100 hover:bg-slate-200 border rounded px-3 py-1.5">
             📍 Use my location
           </button>
-          {geoStatus && (
-            <p className={`text-xs mt-2 ${geoStatus.includes('denied') || geoStatus.includes('unavailable') || geoStatus.includes('Timed') ? 'text-red-600' : 'text-slate-600'}`}>
-              {geoStatus}
-            </p>
-          )}
+          {geoStatus && (() => {
+            const [type, ...rest] = geoStatus.split(':');
+            const msg = rest.join(':');
+            const styles = {
+              error:   'text-red-600 bg-red-50 border border-red-200',
+              success: 'text-green-700 bg-green-50 border border-green-200',
+              loading: 'text-slate-500',
+            };
+            return (
+              <p className={`text-xs mt-2 rounded px-2 py-1 ${styles[type] || 'text-slate-600'}`}>
+                {type === 'error' ? '⚠️ ' : type === 'success' ? '✓ ' : ''}{msg}
+              </p>
+            );
+          })()}
         </div>
 
         <div className="flex items-center gap-3">
