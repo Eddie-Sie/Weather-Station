@@ -183,9 +183,11 @@ export default function DevicePage() {
         <button onClick={() => setTab('live')}      className={`px-4 py-2 rounded ${tab==='live'      ? 'bg-blue-900 text-white' : 'bg-slate-200'}`}>Live</button>
         <button onClick={() => setTab('history')}   className={`px-4 py-2 rounded ${tab==='history'   ? 'bg-blue-900 text-white' : 'bg-slate-200'}`}>History</button>
         <button onClick={() => setTab('assistant')} className={`px-4 py-2 rounded ${tab==='assistant' ? 'bg-blue-900 text-white' : 'bg-slate-200'}`}>Assistant</button>
+        <button onClick={() => setTab('settings')}  className={`px-4 py-2 rounded ${tab==='settings'  ? 'bg-blue-900 text-white' : 'bg-slate-200'}`}>Settings</button>
       </div>
 
       {tab === 'assistant' && <AssistantPanel deviceId={id} deviceLabel={device.locationName || device.deviceId} />}
+      {tab === 'settings'  && <SettingsPanel  deviceId={id} device={device} onSaved={load} />}
 
       {tab === 'live' && (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
@@ -292,6 +294,106 @@ export default function DevicePage() {
   );
 }
 
+// -------- Settings tab --------
+function SettingsPanel({ deviceId, device, onSaved }) {
+  const [locationName, setLocationName] = useState(device.locationName || '');
+  const [lat, setLat]                   = useState(device.latitude  != null ? String(device.latitude)  : '');
+  const [lon, setLon]                   = useState(device.longitude != null ? String(device.longitude) : '');
+  const [geoStatus, setGeoStatus]       = useState('');
+  const [saving,    setSaving]          = useState(false);
+  const [saved,     setSaved]           = useState(false);
+  const [err,       setErr]             = useState('');
+
+  function useMyLocation() {
+    if (!navigator.geolocation) {
+      setGeoStatus('Geolocation is not supported by this browser.');
+      return;
+    }
+    setGeoStatus('Getting location…');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLat(pos.coords.latitude.toFixed(6));
+        setLon(pos.coords.longitude.toFixed(6));
+        setGeoStatus('Location filled in — click Save to store it.');
+      },
+      (error) => {
+        const msgs = {
+          1: 'Permission denied. Please allow location access in your browser settings, then try again.',
+          2: 'Position unavailable. Make sure location services are enabled on this device.',
+          3: 'Timed out waiting for location. Please try again.',
+        };
+        setGeoStatus(msgs[error.code] || 'Could not get location: ' + error.message);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  }
+
+  async function save(e) {
+    e.preventDefault();
+    setSaving(true); setErr(''); setSaved(false);
+    try {
+      await api(`/api/devices/${deviceId}`, {
+        method: 'PATCH',
+        body: {
+          locationName,
+          latitude:  lat  !== '' ? parseFloat(lat)  : null,
+          longitude: lon  !== '' ? parseFloat(lon)  : null,
+        },
+      });
+      setSaved(true);
+      onSaved();   // re-fetch device so header GPS line updates
+    } catch (e) { setErr(e.message); }
+    setSaving(false);
+  }
+
+  return (
+    <div className="bg-white rounded-xl shadow p-5 max-w-lg">
+      <h2 className="font-semibold text-lg mb-4">Device settings</h2>
+      <form onSubmit={save} className="space-y-4">
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Location name</label>
+          <input className="border rounded p-2 w-full"
+                 value={locationName} onChange={e => setLocationName(e.target.value)}
+                 placeholder="e.g. Community Center Kumasi" />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">GPS coordinates</label>
+          <p className="text-xs text-slate-500 mb-2">
+            Used by the AI assistant to fetch local weather forecasts. You can type them manually or click
+            "Use my location" to fill them automatically.
+          </p>
+          <div className="flex gap-2 mb-2">
+            <input className="border rounded p-2 flex-1" placeholder="Latitude  (e.g. 6.6885)"
+                   value={lat} onChange={e => setLat(e.target.value)} />
+            <input className="border rounded p-2 flex-1" placeholder="Longitude (e.g. -1.6244)"
+                   value={lon} onChange={e => setLon(e.target.value)} />
+          </div>
+          <button type="button" onClick={useMyLocation}
+                  className="text-sm bg-slate-100 hover:bg-slate-200 border rounded px-3 py-1.5">
+            📍 Use my location
+          </button>
+          {geoStatus && (
+            <p className={`text-xs mt-2 ${geoStatus.includes('denied') || geoStatus.includes('unavailable') || geoStatus.includes('Timed') ? 'text-red-600' : 'text-slate-600'}`}>
+              {geoStatus}
+            </p>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button disabled={saving}
+                  className="bg-blue-900 text-white rounded px-5 py-2 font-semibold disabled:opacity-50">
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+          {saved && <span className="text-green-700 text-sm">Saved ✓</span>}
+          {err   && <span className="text-red-600  text-sm">{err}</span>}
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function formatValue(key, v) {
   if (v == null) return '—';
   if (typeof v !== 'number') return v;
@@ -356,7 +458,7 @@ function AssistantPanel({ deviceId, deviceLabel }) {
   return (
     <div className="bg-white rounded-xl shadow p-4">
       <p className="text-sm text-slate-600 mb-3">
-        Ask anything about <strong>{deviceLabel}</strong>'s readings. The assistant sees the last 7 days of data for this device.
+        Ask anything about <strong>{deviceLabel}</strong>'s readings. The assistant sees the last 30 days of data for this device, and can look up live weather anywhere in the world.
       </p>
 
       <div className="border rounded p-3 h-80 overflow-auto bg-slate-50 mb-3">
