@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api } from '../../lib/api';
 
 const SENSOR_LABELS = {
@@ -469,10 +471,15 @@ function AssistantPanel({ deviceId, deviceLabel }) {
         )}
         {messages.map((m, i) => (
           <div key={i} className={`mb-3 ${m.role === 'user' ? 'text-right' : ''}`}>
-            <div className={`inline-block rounded-lg px-3 py-2 max-w-[85%] whitespace-pre-wrap text-sm ${
-              m.role === 'user' ? 'bg-blue-900 text-white' : 'bg-white border'}`}>
-              {m.content}
-            </div>
+            {m.role === 'user' ? (
+              <div className="inline-block rounded-lg px-3 py-2 max-w-[85%] whitespace-pre-wrap text-sm bg-blue-900 text-white">
+                {m.content}
+              </div>
+            ) : (
+              <div className="inline-block rounded-lg px-3 py-2 max-w-[85%] text-sm bg-white border text-left ai-message">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+              </div>
+            )}
           </div>
         ))}
         {busy && <p className="text-sm text-slate-500">Thinking...</p>}
