@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceArea } from 'recharts';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../../lib/api';
@@ -28,6 +28,98 @@ const Y_RANGES = {
   nox:         [0, 5],      // NOx index zoomed to typical clean-air range
   pm25:        [0, 100],    // ug/m3
   water:       [0, 1023],   // raw ADC
+};
+
+// ── Colour-zone definitions ───────────────────────────────────────────────────
+// Each sensor gets an array of { y1, y2, color, opacity } bands rendered as
+// ReferenceArea behind the line. Sensors with dynamic line colouring (voc, nox,
+// pm25, water) instead get a ZONES_LINE entry: an array of { max, color } thresholds
+// applied per-segment so the line itself changes colour.
+
+const ZONES_BG = {
+  temperature: [
+    { y1: 0,   y2: 50,  color: '#3b82f6', opacity: 0.08 },  // cold – blue
+    { y1: 50,  y2: 85,  color: '#22c55e', opacity: 0.10 },  // comfortable – green
+    { y1: 85,  y2: 100, color: '#f59e0b', opacity: 0.12 },  // hot – amber
+    { y1: 100, y2: 130, color: '#ef4444', opacity: 0.14 },  // dangerous – red
+  ],
+  humidity: [
+    { y1: 0,  y2: 30,  color: '#3b82f6', opacity: 0.08 },   // too dry – blue
+    { y1: 30, y2: 60,  color: '#22c55e', opacity: 0.10 },   // ideal – green
+    { y1: 60, y2: 80,  color: '#f59e0b', opacity: 0.12 },   // uncomfortable – amber
+    { y1: 80, y2: 100, color: '#ef4444', opacity: 0.14 },   // oppressive – red
+  ],
+  pressure: [
+    { y1: 300,  y2: 980,  color: '#ef4444', opacity: 0.10 }, // storm – red
+    { y1: 980,  y2: 1000, color: '#f59e0b', opacity: 0.10 }, // watch low – amber
+    { y1: 1000, y2: 1020, color: '#22c55e', opacity: 0.10 }, // normal – green
+    { y1: 1020, y2: 1040, color: '#f59e0b', opacity: 0.10 }, // watch high – amber
+    { y1: 1040, y2: 1200, color: '#ef4444', opacity: 0.10 }, // extreme – red
+  ],
+};
+
+// For voc, nox, pm25, water: return a line stroke colour based on the value.
+function zoneColor(key, value) {
+  if (value == null) return '#94a3b8';
+  if (key === 'voc' || key === 'nox') {
+    if (value <= 100) return '#22c55e';
+    if (value <= 200) return '#f59e0b';
+    if (value <= 300) return '#f97316';
+    return '#ef4444';
+  }
+  if (key === 'pm25') {
+    if (value <= 12)  return '#22c55e';
+    if (value <= 35)  return '#f59e0b';
+    if (value <= 55)  return '#f97316';
+    return '#ef4444';
+  }
+  if (key === 'water') {
+    return value >= 400 ? '#3b82f6' : '#22c55e';
+  }
+  return '#0b3d91';
+}
+
+// Zone legend items shown below each chart that has background bands.
+const ZONE_LEGENDS = {
+  temperature: [
+    { label: 'Cold (<50°F)',        color: '#3b82f6' },
+    { label: 'Comfortable (50–85)', color: '#22c55e' },
+    { label: 'Hot (85–100)',        color: '#f59e0b' },
+    { label: 'Dangerous (>100)',    color: '#ef4444' },
+  ],
+  humidity: [
+    { label: 'Too dry (<30%)',      color: '#3b82f6' },
+    { label: 'Ideal (30–60)',       color: '#22c55e' },
+    { label: 'Uncomfortable (60–80)', color: '#f59e0b' },
+    { label: 'Oppressive (>80)',    color: '#ef4444' },
+  ],
+  pressure: [
+    { label: 'Normal (1000–1020)', color: '#22c55e' },
+    { label: 'Watch',              color: '#f59e0b' },
+    { label: 'Extreme / Storm',    color: '#ef4444' },
+  ],
+  voc:  [
+    { label: 'Good (≤100)',    color: '#22c55e' },
+    { label: 'Moderate (≤200)', color: '#f59e0b' },
+    { label: 'Poor (≤300)',    color: '#f97316' },
+    { label: 'Unhealthy',      color: '#ef4444' },
+  ],
+  nox:  [
+    { label: 'Good (≤100)',    color: '#22c55e' },
+    { label: 'Moderate (≤200)', color: '#f59e0b' },
+    { label: 'Poor (≤300)',    color: '#f97316' },
+    { label: 'Unhealthy',      color: '#ef4444' },
+  ],
+  pm25: [
+    { label: 'Good (≤12 µg/m³)',   color: '#22c55e' },
+    { label: 'Moderate (≤35)',     color: '#f59e0b' },
+    { label: 'Sensitive (≤55)',    color: '#f97316' },
+    { label: 'Unhealthy (>55)',    color: '#ef4444' },
+  ],
+  water: [
+    { label: 'Clear',   color: '#22c55e' },
+    { label: 'Raining', color: '#3b82f6' },
+  ],
 };
 
 // Keys shown as tiles on the Live tab. `airquality` is the synthetic combined
@@ -236,22 +328,47 @@ export default function DevicePage() {
             <button onClick={exportCsv} className="bg-blue-900 text-white rounded px-4 py-2 text-sm">Export CSV</button>
           </div>
           {Object.keys(SENSOR_LABELS).map(k => {
-            // Build the series and explicitly sort by timestamp ascending so
-            // the x-axis always reads left-to-right in normal forward time,
-            // regardless of how the backend returned the array.
             const data = history
               .map(r => ({
                 ts: new Date(r.ts).getTime(),
                 value: typeof r.sensors?.[k]?.value === 'number' ? r.sensors[k].value : null,
               }))
               .sort((a, b) => a.ts - b.ts);
+
+            const bgZones  = ZONES_BG[k] || [];
+            const legends  = ZONE_LEGENDS[k] || [];
+            // For sensors without bg zones, derive line colour from the latest value.
+            const useDynLine = !ZONES_BG[k];
+            const latestVal  = data.filter(d => d.value != null).slice(-1)[0]?.value ?? null;
+            const lineColor  = useDynLine ? zoneColor(k, latestVal) : '#0b3d91';
+
             return (
               <div key={k} className="bg-white rounded-xl shadow p-4 mb-4">
-                <h3 className="font-semibold mb-2">{SENSOR_LABELS[k]}</h3>
+                <h3 className="font-semibold mb-1">{SENSOR_LABELS[k]}</h3>
+
+                {/* Zone legend */}
+                {legends.length > 0 && (
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 mb-2">
+                    {legends.map(l => (
+                      <span key={l.label} className="flex items-center gap-1 text-xs text-slate-500">
+                        <span style={{ display:'inline-block', width:10, height:10, borderRadius:2, background:l.color }} />
+                        {l.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
                 <div style={{ width: '100%', height: 180 }}>
                   <ResponsiveContainer>
                     <LineChart data={data}>
-                      <CartesianGrid strokeDasharray="3 3" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+
+                      {/* Background colour bands */}
+                      {bgZones.map((z, i) => (
+                        <ReferenceArea key={i} y1={z.y1} y2={z.y2}
+                          fill={z.color} fillOpacity={z.opacity} ifOverflow="hidden" />
+                      ))}
+
                       <XAxis
                         dataKey="ts"
                         type="number"
@@ -259,10 +376,27 @@ export default function DevicePage() {
                         scale="time"
                         ticks={ticksEvery12h(data[0]?.ts, data[data.length - 1]?.ts)}
                         tickFormatter={format12hTick}
+                        tick={{ fontSize: 11, fill: '#64748b' }}
                       />
-                      <YAxis domain={Y_RANGES[k] || ['auto', 'auto']} allowDataOverflow />
-                      <Tooltip labelFormatter={t => new Date(t).toLocaleString()} />
-                      <Line type="monotone" dataKey="value" dot={false} stroke="#0b3d91" isAnimationActive={false} />
+                      <YAxis
+                        domain={Y_RANGES[k] || ['auto', 'auto']}
+                        allowDataOverflow
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        width={42}
+                      />
+                      <Tooltip
+                        labelFormatter={t => new Date(t).toLocaleString()}
+                        contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="value"
+                        dot={false}
+                        stroke={lineColor}
+                        strokeWidth={2}
+                        isAnimationActive={false}
+                        connectNulls={false}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
