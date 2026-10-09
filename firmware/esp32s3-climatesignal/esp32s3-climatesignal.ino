@@ -162,6 +162,7 @@ unsigned long lastReadAt          = 0;
 unsigned long lastWifiRetryAt     = 0;
 unsigned long lastSgpTickAt       = 0;
 unsigned long wifiOfflineSinceMs  = 0;
+unsigned long lastPortalBannerAt  = 0;
 bool          fallbackAPActive    = false;
 uint32_t      cycleCounter        = 0;
 uint32_t      sgpConditioningSecs = 0;
@@ -315,6 +316,11 @@ void loop() {
     if (inProvisioningMode) {
         dnsServer.processNextRequest();
         portalServer.handleClient();
+        // Repeat the connection banner every 15 s so it's easy to spot
+        if (millis() - lastPortalBannerAt > 15000) {
+            lastPortalBannerAt = millis();
+            printPortalBanner("WeatherNode-" + macSuffix(), WiFi.softAPIP());
+        }
         return;
     }
 
@@ -334,8 +340,9 @@ void loop() {
             WiFi.mode(WIFI_AP_STA);
             String apName = "WeatherNode-" + macSuffix();
             WiFi.softAP(apName.c_str(), AP_PASSWORD);
-            Serial.printf("AP: %s  IP: ", apName.c_str());
-            Serial.println(WiFi.softAPIP());
+            delay(500);
+            printPortalBanner(apName, WiFi.softAPIP());
+            lastPortalBannerAt = millis();
             dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
             portalServer.on("/",       handlePortalRoot);
             portalServer.on("/save",   HTTP_POST, handlePortalSave);
@@ -1016,21 +1023,38 @@ const char PORTAL_HTML[] PROGMEM = R"rawhtml(
 </body></html>
 )rawhtml";
 
+void printPortalBanner(const String& apName, const IPAddress& ip) {
+    Serial.println();
+    Serial.println(F("┌─────────────────────────────────────────┐"));
+    Serial.println(F("│         SETUP PORTAL IS ACTIVE          │"));
+    Serial.println(F("├─────────────────────────────────────────┤"));
+    Serial.print(  F("│  WiFi name : "));
+    Serial.print(apName);
+    for (int i = apName.length(); i < 27; i++) Serial.print(' ');
+    Serial.println(F(" │"));
+    Serial.print(  F("│  Password  : corefutures16             │\n"));
+    Serial.print(  F("│  Then open : http://"));
+    Serial.print(ip);
+    Serial.println(F("            │"));
+    Serial.println(F("└─────────────────────────────────────────┘"));
+    Serial.println();
+}
+
 void startProvisioningPortal() {
     inProvisioningMode = true;
     WiFi.mode(WIFI_AP);
     String apName = "WeatherNode-" + macSuffix();
     WiFi.softAP(apName.c_str(), AP_PASSWORD);
-    Serial.printf("AP: %s  IP: ", apName.c_str());
-    Serial.println(WiFi.softAPIP());
-    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+    delay(500);   // softAP needs a moment before softAPIP() is valid
+    IPAddress ip = WiFi.softAPIP();
+    printPortalBanner(apName, ip);
+    dnsServer.start(DNS_PORT, "*", ip);
     portalServer.on("/",       handlePortalRoot);
     portalServer.on("/save",   HTTP_POST, handlePortalSave);
     portalServer.on("/status", handlePortalStatus);
     portalServer.on("/scan",   handlePortalScan);
     portalServer.onNotFound(   handlePortalRoot);
     portalServer.begin();
-    Serial.println(F("Portal ready."));
 }
 
 void handlePortalRoot() {
