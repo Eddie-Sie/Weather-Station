@@ -479,47 +479,64 @@ void goToDeepSleep() {
 // SENSOR INIT
 // =============================================================================
 void setupSensors() {
+    // Each probe flushes Serial first so a crash mid-init is easy to spot:
+    // the last "Probing..." line without a result is where it died.
+
     if (!have_aht) {
+        Serial.print(F("Probing AHT20  ... ")); Serial.flush();
         have_aht = aht.begin();
-        Serial.printf("AHT20  : %s\n", have_aht ? "OK" : "not found");
+        Serial.println(have_aht ? F("OK") : F("not found"));
     }
+
     if (!have_dps) {
+        Serial.print(F("Probing DPS310 ... ")); Serial.flush();
         have_dps = dps.begin_I2C(0x77) || dps.begin_I2C(0x76);
         if (have_dps) {
             dps.configurePressure(DPS310_64HZ, DPS310_64SAMPLES);
             dps.configureTemperature(DPS310_64HZ, DPS310_64SAMPLES);
         }
-        Serial.printf("DPS310 : %s\n", have_dps ? "OK" : "not found");
+        Serial.println(have_dps ? F("OK") : F("not found"));
     }
+
     if (!have_sgp41) {
+        Serial.print(F("Probing SGP41  ... ")); Serial.flush();
         sgp41.begin(Wire);
         uint16_t sn[3];
         have_sgp41 = (sgp41.getSerialNumber(sn) == 0);
-        Serial.printf("SGP41  : %s\n", have_sgp41 ? "OK" : "not found");
+        Serial.println(have_sgp41 ? F("OK") : F("not found"));
     }
+
     if (!have_hm3301) {
-        have_hm3301 = (hm3301.init() == NO_ERROR);
-        Serial.printf("HM3301 : %s\n", have_hm3301 ? "OK" : "not found");
+        // The Seeed HM3301 library may call Wire.begin() internally with default
+        // pins on some versions. Re-assert our pin config immediately after init
+        // to prevent a bus conflict on ESP32-S3.
+        Serial.print(F("Probing HM3301 ... ")); Serial.flush();
+        int hm_err = hm3301.init();
+        Wire.begin(PIN_SDA, PIN_SCL);   // re-assert in case library clobbered it
+        Wire.setClock(50000);
+        have_hm3301 = (hm_err == NO_ERROR);
+        Serial.println(have_hm3301 ? F("OK") : F("not found"));
     }
+
     if (!have_rtc) {
+        Serial.print(F("Probing DS3231M... ")); Serial.flush();
         have_rtc = rtc.begin(&Wire);
         if (have_rtc) {
             if (rtc.lostPower()) {
-                // RTC lost power and needs a time set.
-                // It will be set to NTP time once WiFi connects; until then
-                // it holds an approximate time (0000-01-01 if never set).
-                Serial.println(F("DS3231M: lost power — time will sync after NTP."));
+                Serial.println(F("OK (lost power — will sync from NTP)"));
             } else {
-                Serial.println(F("DS3231M: OK (battery-backed time valid)."));
+                Serial.println(F("OK (battery-backed time valid)"));
             }
         } else {
-            Serial.println(F("DS3231M: not found"));
+            Serial.println(F("not found"));
         }
     }
+
     // Water sensor — analog read, no init needed beyond setting ADC mode.
     // GPIO1 = ADC1_CH0 on ESP32-S3 — fully supported by analogRead().
     pinMode(PIN_WATER, INPUT);
     analogSetAttenuation(ADC_11db);   // full 0–3.3V range for 12-bit read
+    Serial.println(F("Water  : ready (analog GPIO1)"));
 }
 
 // =============================================================================
