@@ -1122,8 +1122,11 @@ void handlePortalSave() {
 // UTIL
 // =============================================================================
 String macSuffix() {
+    // Read from the hardware eFuse base MAC — always the same regardless of
+    // whether WiFi is in STA, AP, or AP+STA mode (WiFi.macAddress() shifts
+    // the last byte in AP mode, causing the ID and AP name to differ).
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    esp_efuse_mac_get_default(mac);
     char buf[7];
     snprintf(buf, sizeof(buf), "%02X%02X%02X", mac[3], mac[4], mac[5]);
     return String(buf);
