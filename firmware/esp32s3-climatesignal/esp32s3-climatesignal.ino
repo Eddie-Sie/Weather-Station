@@ -73,6 +73,7 @@ typedef uint32_t u32;
 #include <time.h>
 #include <SD.h>
 #include <SPI.h>
+#include <esp_mac.h>     // esp_efuse_mac_get_default() — consistent base MAC
 
 // ── Sensor / RTC libraries ───────────────────────────────────────────────────
 #include <Adafruit_AHTX0.h>
